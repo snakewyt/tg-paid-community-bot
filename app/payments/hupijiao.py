@@ -77,7 +77,13 @@ def extract_backend_order_id(raw_body: str) -> str | None:
     try:
         params = dict(urllib.parse.parse_qsl(raw_body))
         plugins = params.get("plugins", "")
-        # plugins = "order_id|alipay" or plain order_id
         return plugins.split("|")[0] if "|" in plugins else params.get("trade_order_id")
     except Exception:
+        return None
+
+
+def extract_backend_money(raw_body: str) -> float | None:
+    try:
+        return float(dict(urllib.parse.parse_qsl(raw_body)).get("total_fee", 0))
+    except (TypeError, ValueError):
         return None

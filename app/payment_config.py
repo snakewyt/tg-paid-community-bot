@@ -1,12 +1,4 @@
-"""Runtime payment configuration layer.
-
-At startup main.py calls init_config() which seeds config from .env settings,
-then layers data/payment_config.json on top if it exists.
-
-The admin panel can read via get_config() and write via save_config(),
-which persist to JSON and update the in-memory settings singleton so
-all payment providers pick up changes immediately.
-"""
+"""Persist updates to JSON and update in-memory settings."""
 
 from __future__ import annotations
 
@@ -21,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path("data/payment_config.json")
 
-# Which keys from settings belong to the payment layer.
 PAYMENT_KEYS = {
     "stars_enabled", "stars_provider_token",
     "crypto_enabled", "crypto_api_token",
@@ -32,8 +23,6 @@ PAYMENT_KEYS = {
     "hupijiao_enabled", "hupijiao_api_url", "hupijiao_appid", "hupijiao_appsecret", "hupijiao_notify_url", "hupijiao_return_url",
 }
 
-# Field metadata: display_group, label, placeholder, type hint for the admin panel.
-# Order matters — groups are rendered in definition order.
 FIELD_META = {
     "stars_enabled":           ("Telegram Stars", "启用", "", "bool"),
     "stars_provider_token":    ("Telegram Stars", "Provider Token", "留空则使用 Bot Token", "password"),
@@ -60,7 +49,6 @@ FIELD_META = {
     "hupijiao_return_url":     ("虎皮椒 (HuPiJiao)", "支付完成跳转", "用户付完款后跳转的地址", "text"),
 }
 
-# Ordered groups for rendering.
 GROUPS = [
     "Telegram Stars",
     "CryptoBot (USDT)",
@@ -72,7 +60,6 @@ GROUPS = [
 ]
 
 ROUTING_GROUPS = frozenset({"支付宝路由", "微信支付路由"})
-# Shared backend sections — shown when any routing selector picks that backend.
 BACKEND_SECTION_IDS = {
     "易支付 (Epay)": "backend-section-epay",
     "虎皮椒 (HuPiJiao)": "backend-section-hupijiao",
@@ -86,7 +73,6 @@ _config_cache: dict = {}
 
 
 def init_config() -> None:
-    """Seed from .env settings, then layer persisted overrides."""
     global _config_cache
     _config_cache = {k: getattr(settings, k) for k in PAYMENT_KEYS}
     if CONFIG_PATH.exists():
@@ -102,25 +88,35 @@ def init_config() -> None:
 
 
 def get_config() -> dict:
-    """Return a snapshot of the current payment configuration."""
     return deepcopy(_config_cache)
 
 
 def save_config(data: dict) -> None:
-    """Persist updates to JSON and update in-memory settings."""
+    """Persist updates; merge bools and keep secrets when fields left blank."""
     global _config_cache
-    clean = {}
+    merged = deepcopy(_config_cache)
+    bool_keys = {k for k, m in FIELD_META.items() if m[3] == "bool"}
+
+    for k in bool_keys:
+        raw = data.get(k, "off")
+        merged[k] = str(raw).lower() in ("true", "on", "1", "yes")
+
     for k, v in data.items():
-        if k not in PAYMENT_KEYS:
+        if k not in PAYMENT_KEYS or k in bool_keys:
             continue
-        # Coerce bools (form returns "on"/"off" strings)
         meta = FIELD_META.get(k)
-        if meta and meta[3] == "bool":
-            v = str(v).lower() in ("true", "on", "1", "yes")
-        clean[k] = v
+        if meta and meta[3] == "password" and not str(v).strip():
+            continue
+        merged[k] = v
+
+    for k, v in merged.items():
         _config_cache[k] = v
         setattr(settings, k, v)
 
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(clean, indent=2, ensure_ascii=False))
-    logger.info("Payment config saved to %s (%d keys)", CONFIG_PATH, len(clean))
+    CONFIG_PATH.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
+    try:
+        CONFIG_PATH.chmod(0o600)
+    except OSError:
+        pass
+    logger.info("Payment config saved to %s", CONFIG_PATH)

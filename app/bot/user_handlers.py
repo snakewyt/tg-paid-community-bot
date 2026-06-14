@@ -152,6 +152,9 @@ async def on_pay_select(callback: CallbackQuery):
             "alipay": ("CNY", plan.price_alipay),
             "wechat": ("CNY", plan.price_wechat),
         }
+        if provider_name not in price_map:
+            await callback.answer("Invalid payment method.", show_alert=True)
+            return
         currency, amount = price_map[provider_name]
 
         if not amount:
@@ -164,6 +167,7 @@ async def on_pay_select(callback: CallbackQuery):
         order = await create_order(
             session, callback.from_user.id, plan, provider, float(amount), currency
         )
+        order_id = order.id
         await session.commit()
 
     result = await provider.create_payment(order, plan)
@@ -195,6 +199,13 @@ async def on_pay_select(callback: CallbackQuery):
         await callback.answer()
         return
 
+    if result.provider_tx_id:
+        async with async_session_factory() as session:
+            o = await session.get(Order, order_id)
+            if o:
+                o.external_id = result.provider_tx_id
+                await session.commit()
+
     await callback.message.edit_text(
         f"Pay {amount} {currency} to join <b>{plan.name}</b>:\n\n{result.pay_url}",
         reply_markup=InlineKeyboardMarkup(
@@ -211,19 +222,22 @@ async def cmd_my(message: Message):
     user = await _ensure_user(message.from_user)
 
     async with async_session_factory() as session:
-        subs = await get_active_subscriptions(session, user.id)
+        from sqlalchemy import select
 
-    if not subs:
-        await message.answer("You have no active subscriptions. Use /start to subscribe.")
-        return
+        subs = await get_active_subscriptions(session, user.id)
+        if not subs:
+            await message.answer("You have no active subscriptions. Use /start to subscribe.")
+            return
+
+        plan_ids = {s.plan_id for s in subs}
+        plans = (
+            await session.execute(select(Plan).where(Plan.id.in_(plan_ids)))
+        ).scalars().all()
+        plan_map = {p.id: p for p in plans}
 
     lines = ["<b>Your Subscriptions:</b>", ""]
     for sub in subs:
-        from sqlalchemy import select
-
-        async with async_session_factory() as session:
-            plan = await session.get(Plan, sub.plan_id)
-
+        plan = plan_map.get(sub.plan_id)
         plan_name = plan.name if plan else f"Plan #{sub.plan_id}"
         exp = sub.expires_at.strftime("%Y-%m-%d %H:%M UTC")
         lines.append(f"  • {plan_name} — expires {exp}")

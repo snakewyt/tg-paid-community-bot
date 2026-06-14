@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 CRYPTO_API_BASE = "https://pay.crypt.bot/api"
 
 
+def _parse_body(raw_body: str) -> dict | None:
+    try:
+        return json.loads(raw_body)
+    except Exception:
+        return None
+
+
 class CryptoProvider(BasePaymentProvider):
     name = "crypto"
 
@@ -62,14 +69,43 @@ class CryptoProvider(BasePaymentProvider):
     async def verify_callback(self, data: CallbackData) -> bool:
         if not data.signature:
             return False
-        return self._check_signature(data.raw_body, data.signature)
+        if not self._check_signature(data.raw_body, data.signature):
+            return False
+        body = _parse_body(data.raw_body)
+        if not body or body.get("update_type") != "invoice_paid":
+            return False
+        invoice = body.get("payload")
+        if not isinstance(invoice, dict) or invoice.get("status") != "paid":
+            return False
+        return True
 
     async def extract_order_id(self, data: CallbackData) -> str | None:
-        try:
-            body = json.loads(data.raw_body)
-            return str(body.get("payload"))
-        except Exception:
+        body = _parse_body(data.raw_body)
+        if not body:
             return None
+        invoice = body.get("payload")
+        if isinstance(invoice, dict):
+            oid = invoice.get("payload")
+            return str(oid) if oid else None
+        return None
+
+    async def verify_payment_amount(self, data: CallbackData, order: Order) -> bool:
+        if order.amount == 0:
+            return True
+        body = _parse_body(data.raw_body)
+        if not body:
+            return False
+        invoice = body.get("payload")
+        if not isinstance(invoice, dict):
+            return False
+        try:
+            paid = float(invoice.get("amount", 0))
+        except (TypeError, ValueError):
+            return False
+        asset = str(invoice.get("asset", "")).upper()
+        if asset and asset != order.currency.upper():
+            return False
+        return abs(paid - order.amount) < 0.001
 
 
 provider = CryptoProvider()

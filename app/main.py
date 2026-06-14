@@ -48,6 +48,9 @@ def main():
 
         init_payment_config()
 
+        from app.bot_config import init_bot_config
+        init_bot_config()
+
         start_scheduler()
 
         await bot.delete_webhook(drop_pending_updates=True)

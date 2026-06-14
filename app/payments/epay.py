@@ -76,3 +76,10 @@ def extract_backend_order_id(raw_body: str) -> str | None:
         return dict(urllib.parse.parse_qsl(raw_body)).get("out_trade_no")
     except Exception:
         return None
+
+
+def extract_backend_money(raw_body: str) -> float | None:
+    try:
+        return float(dict(urllib.parse.parse_qsl(raw_body)).get("money", 0))
+    except (TypeError, ValueError):
+        return None

@@ -19,6 +19,7 @@ async def get_active_subscriptions(
     stmt = select(Subscription).where(
         Subscription.user_id == user_id,
         Subscription.status == SubscriptionStatus.active,
+        Subscription.expires_at > utcnow(),
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())

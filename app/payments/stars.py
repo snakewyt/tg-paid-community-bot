@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
 
 from app.config import settings
 from app.models.models import Order, Plan
@@ -20,8 +19,6 @@ class StarsProvider(BasePaymentProvider):
         return bool(settings.stars_enabled and settings.bot_token)
 
     async def create_payment(self, order: Order, plan: Plan) -> PaymentResult:
-        # Telegram Stars payment is initiated by the bot handler via sendInvoice.
-        # We just return the order payload to be used as invoice payload.
         payload = json.dumps({"order_id": order.id, "provider": self.name})
         return PaymentResult(
             success=True,
@@ -29,12 +26,21 @@ class StarsProvider(BasePaymentProvider):
         )
 
     async def verify_callback(self, data: CallbackData) -> bool:
-        # Telegram Stars callbacks are verified by Telegram itself via
-        # pre_checkout_query / successful_payment handlers. No extra sig check needed.
-        return True
+        return bool(data.order_id)
 
     async def extract_order_id(self, data: CallbackData) -> str | None:
         return data.order_id
+
+    async def verify_payment_amount(self, data: CallbackData, order: Order) -> bool:
+        if order.amount == 0:
+            return True
+        try:
+            body = json.loads(data.raw_body)
+            paid = int(body.get("total_amount", -1))
+            currency = str(body.get("currency", "")).upper()
+            return paid == int(order.amount) and currency == order.currency.upper()
+        except Exception:
+            return False
 
 
 provider = StarsProvider()

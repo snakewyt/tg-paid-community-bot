@@ -44,6 +44,16 @@ class BasePaymentProvider(ABC):
     def is_configured(self) -> bool:
         ...
 
+    async def verify_payment_amount(self, data: CallbackData, order: "Order") -> bool:
+        """Return True if callback amount/currency matches the order. Override per provider."""
+        if order.amount == 0:
+            return True
+        return True
+
+    async def extract_external_id(self, data: CallbackData) -> str | None:
+        """Optional provider transaction id for reconciliation/refunds."""
+        return None
+
 
 _providers: dict[str, BasePaymentProvider] = {}
 

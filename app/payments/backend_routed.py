@@ -47,3 +47,14 @@ class BackendRoutedProvider(BasePaymentProvider):
         if backend is None:
             return None
         return backend.extract_backend_order_id(data.raw_body)
+
+    async def verify_payment_amount(self, data: CallbackData, order: Order) -> bool:
+        if order.amount == 0:
+            return True
+        backend = self._backend()
+        if backend is None:
+            return False
+        paid = backend.extract_backend_money(data.raw_body)
+        if paid is None:
+            return False
+        return abs(paid - order.amount) < 0.02

@@ -14,6 +14,16 @@ from app.payments.base import BasePaymentProvider, CallbackData, PaymentResult, 
 logger = logging.getLogger(__name__)
 
 
+def construct_stripe_event(raw_body: str, signature: str):
+    """Verify signature and return parsed Stripe event."""
+    stripe.api_key = settings.stripe_secret_key
+    return stripe.Webhook.construct_event(
+        raw_body,
+        signature or "",
+        settings.stripe_webhook_secret,
+    )
+
+
 class StripeProvider(BasePaymentProvider):
     name = "stripe"
 
@@ -57,13 +67,8 @@ class StripeProvider(BasePaymentProvider):
 
     async def verify_callback(self, data: CallbackData) -> bool:
         try:
-            # construct_event requires the raw request body for signature verification
-            stripe.Webhook.construct_event(
-                data.raw_body,
-                data.signature or "",
-                settings.stripe_webhook_secret,
-            )
-            return True
+            event = construct_stripe_event(data.raw_body, data.signature or "")
+            return event.get("type") == "checkout.session.completed"
         except Exception:
             return False
 
@@ -72,6 +77,27 @@ class StripeProvider(BasePaymentProvider):
             event = json.loads(data.raw_body)
             obj = event.get("data", {}).get("object", {})
             return obj.get("client_reference_id") or obj.get("metadata", {}).get("order_id")
+        except Exception:
+            return None
+
+    async def verify_payment_amount(self, data: CallbackData, order: Order) -> bool:
+        if order.amount == 0:
+            return True
+        try:
+            event = json.loads(data.raw_body)
+            obj = event.get("data", {}).get("object", {})
+            paid_cents = obj.get("amount_total")
+            if paid_cents is None:
+                return False
+            return int(paid_cents) == int(order.amount)
+        except Exception:
+            return False
+
+    async def extract_external_id(self, data: CallbackData) -> str | None:
+        try:
+            event = json.loads(data.raw_body)
+            obj = event.get("data", {}).get("object", {})
+            return obj.get("payment_intent") or obj.get("id")
         except Exception:
             return None
 

@@ -4,114 +4,98 @@
 
 ## 功能特性
 
-- **套餐管理**：支持多种套餐，独立定价，可随时上架/下架
-- **五种支付方式**：Telegram Stars（零配置）、CryptoBot（USDT/TON）、Stripe（信用卡）、支付宝、微信支付
-- **支付后台路由**：支付宝和微信支付可选择虎皮椒或易支付作为后台，前端动态切换配置
-- **入群保护**：生成一次性入群链接，用户点击发起入群申请，机器人仅批准活跃会员——链接外泄无效
-- **自动到期处理**：到期自动踢出群并解除封禁，允许再次付费加入
-- **续费提醒**：可配置提前 N 天提醒，每会员每周期仅提醒一次，续费后重置
-- **支付容错**：原子操作防并发重复履约，超时订单自动清理，迟到付款自动"复活"
-- **管理后台**：Web 面板查看数据、管理套餐和会员、配置支付和机器人参数
-- **管理员命令**：Telegram 内直接操作（创建套餐、赠送会员、调整到期日、群发消息等）
-- **Docker 一键部署**：附带 Nginx + HTTPS 配置教程
+- **套餐管理**：多种套餐、独立定价、随时上架/下架；群组 ID 创建后不可改
+- **五种支付方式**：Telegram Stars、CryptoBot（USDT）、Stripe、支付宝、微信支付
+- **支付后台路由**：支付宝/微信可分别选择易支付或虎皮椒，后台配置页动态显示
+- **入群保护**：入群申请模式，仅活跃会员自动批准，链接外泄无效
+- **支付安全**：回调验签、金额校验、幂等履约、并发防重复、网关重试不重复发链接
+- **支付容错**：超时订单自动清理、迟到付款自动「复活」、Stripe 失败/退款自动处理
+- **自动到期**：到期踢人（踢失败则重试，不误标过期）、续费提醒（支持 `{days}` / `{expiry_date}`）
+- **管理后台**：仪表盘、套餐/会员/订单管理、**后台赠送会员**、调整到期日、支付与机器人配置
+- **管理员命令**：Telegram 内 `/grant`、`/setexpiry`、`/broadcast` 等（仅 `ADMIN_IDS` 数字 ID 授权）
+- **Docker 部署**：含 Nginx + HTTPS 教程，见 [docs/CONFIG_GUIDE.md](docs/CONFIG_GUIDE.md)
 
 ## 快速开始
 
-### 1. 创建 Telegram 机器人
-
-与 [@BotFather](https://t.me/BotFather) 对话，发送 `/newbot`，按提示创建机器人，获取 token。
-
-### 2. 获取群/频道 chat_id
-
-创建你的付费群或频道，把机器人拉进去设为管理员（至少勾选"邀请用户"和"禁言/移除成员"权限）。用 [@getidsbot](https://t.me/getidsbot) 获取 chat_id。
-
-### 3. 克隆并配置
-
 ```bash
+git clone https://github.com/snakewyt/tg-paid-community-bot.git
+cd tg-paid-community-bot
 cp .env.example .env
-# 编辑 .env，填入你的 bot token 和管理员用户 ID
+# 编辑 .env：BOT_TOKEN、ADMIN_IDS
+docker compose up -d
 ```
 
-最小配置：
+最小 `.env`：
 
 ```env
 BOT_TOKEN=123456:ABC-DEF1234gh
 ADMIN_IDS=123456789
 ```
 
-### 4. 启动
-
-```bash
-# Docker 部署
-docker compose up -d
-
-# 或本地运行
-pip install -r requirements.txt
-python -m app.main
-```
-
-### 5. 创建套餐
-
-在 Telegram 里对机器人发：
+创建第一个套餐（Telegram 对机器人发）：
 
 ```
 /addplan 月度会员 30 -1001234567890 150
 ```
 
-参数依次为：名称、天数、群 chat_id、Stars 价格。
-
-详细配置教程见 [docs/CONFIG_GUIDE.md](docs/CONFIG_GUIDE.md)。
-
 ## 支付方式
 
-| 支付方式 | 配置难度 | 说明 |
-|---------|---------|------|
-| Telegram Stars | 零配置 | Telegram 原生支付，用户用 Stars 购买 |
-| CryptoBot | 简单 | 支持 USDT / TON，需在 @CryptoBot 创建 App |
-| Stripe | 中等 | 信用卡支付，需 Stripe 商户账号 |
-| 支付宝 | 中等 | 可路由到虎皮椒或易支付后台 |
-| 微信支付 | 中等 | 可路由到虎皮椒或易支付后台 |
+| 支付方式 | 说明 |
+|---------|------|
+| Telegram Stars | 零配置，填 `STARS_ENABLED=true` |
+| CryptoBot | USDT，需 API Token |
+| Stripe | 信用卡（美分定价），支持退款 webhook |
+| 支付宝 / 微信 | 路由到易支付或虎皮椒 |
 
-每个支付方式有独立的启用开关和套餐定价。套餐中将某支付方式价格设为 0 即表示该方式不启用，用户端不显示。
+套餐价格填 `0` = 该渠道不启用。Stripe 价格为**美分**（499 = $4.99）。
+
+## 管理后台
+
+访问 `http://服务器:8000/admin/login`
+
+| 项目 | 说明 |
+|------|------|
+| 默认账号 | `admin` / `123456`（首次登录强制改密） |
+| 首页 | 统计、套餐、**赠送会员**、会员调整/移除、订单 |
+| 机器人配置 | Token、欢迎语、超时、到期提醒（Bot Token 留空=不修改） |
+| 支付设置 | 全渠道开关与密钥（密钥留空=不修改） |
+
+可选安全加固（`.env`）：
+
+```env
+# 仅允许这些 IP 访问 /admin（逗号分隔，留空=不限制）
+ADMIN_PANEL_ALLOWED_IPS=你的公网IP
+```
+
+生产环境务必配置 Nginx + HTTPS，详见配置教程第 8 节。
 
 ## 管理员命令
 
 | 命令 | 说明 |
 |------|------|
-| `/admin` | 显示所有管理命令 |
-| `/addplan 名称 天数 群ID [stars] [usdt] [美分] [cny]` | 创建套餐 |
-| `/editplan <id> <字段> <值>` | 修改套餐（chat_id 不可改） |
-| `/delplan <id>` | 停用套餐 |
-| `/plans` | 查看所有套餐 |
-| `/stats` | 收入统计 + 活跃会员数 |
-| `/grant <用户ID> <套餐ID> <天数>` | 赠送会员 |
-| `/setexpiry <用户ID> <套餐ID> <+N/-N/日期>` | 调整到期时间 |
-| `/active` | 所有活跃订阅列表 |
-| `/broadcast <消息>` | 群发所有人（自动限速 ~25条/秒） |
+| `/addplan 名称 天数 群ID [价格...]` | 创建套餐 |
+| `/editplan <id> <字段> <值>` | 改套餐（**不可改 chat_id**） |
+| `/grant <用户ID> <套餐ID> <天数>` | 赠送会员（与后台赠送逻辑一致） |
+| `/setexpiry <用户ID> <套餐ID> <+N/-N/日期>` | 调整到期（改到过去会立即踢人） |
+| `/stats` / `/active` / `/broadcast` | 统计 / 活跃列表 / 群发（限速 ~25条/秒，上限 5000 人） |
 
-## 管理后台
+> Bot 管理员权限**仅认** `.env` 中的 `ADMIN_IDS` 数字 ID，不认用户名。
 
-启动后访问 `http://你的服务器:8000/admin/login`。
+## 升级
 
-- **默认账号**：`admin` / `123456`（首次登录强制修改密码）
-- **首页仪表盘**：收入统计、套餐管理、会员管理、订单流水
-- **机器人配置**：Token、汇率、欢迎语、超时时间、到期提醒等
-- **支付设置**：所有支付渠道配置，保存即时生效
+```bash
+git pull
+docker compose down
+docker compose up -d --build
+# 容器内会自动 alembic upgrade head；也可手动：
+docker compose exec bot alembic upgrade head
+```
 
-## 架构
+## 架构概览
 
 ```
-用户 → Bot (/start) → 选择套餐 → 选择支付方式
-  ├── Stars: Telegram 原生发票 → 回调
-  ├── CryptoBot: API 创建发票 → Webhook 回调
-  ├── Stripe: Checkout Session → Webhook 回调
-  └── 支付宝/微信: 跳转支付页面 → Webhook 回调
-                         ↓
-           支付回调 → 验证签名 → 履约订单 → 创建/延长订阅
-                         ↓
-           Bot 发送一次性入群链接 → 用户入群
-                         ↓
-           定时任务: 每小时检查到期 → 踢出过期用户
-                    每天检查即将到期 → 发送续费提醒
-                    每15分钟清理超时未付订单
+用户 /start → 选套餐 → 选支付 → 回调验签+金额校验 → 幂等履约 → 发入群链接
+定时任务：每小时踢到期 / 每6h续费提醒 / 每15min清理超时订单
 ```
+
+完整部署与域名、支付、安全说明 → [docs/CONFIG_GUIDE.md](docs/CONFIG_GUIDE.md)

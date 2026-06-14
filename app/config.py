@@ -57,9 +57,10 @@ class Settings(BaseSettings):
 
     # --- Admin web panel ---
     # Defaults: admin / 123456. Change via the panel on first login.
-    # Override in .env to set custom initial credentials.
     admin_panel_username: str = "admin"
     admin_panel_password: str = "123456"
+    # Comma-separated IPs allowed to access /admin (empty = allow all)
+    admin_panel_allowed_ips: str = ""
 
     # --- Bot behavior (configurable via admin panel) ---
     usdt_rate: float = 7.20

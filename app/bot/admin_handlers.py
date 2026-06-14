@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+import logging
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
@@ -16,37 +16,25 @@ from app.database import async_session_factory
 from app.models.models import (
     Order,
     OrderStatus,
-    PaymentProvider,
     Plan,
     Subscription,
     SubscriptionStatus,
     User,
 )
+from app.services.grant import grant_subscription
+from app.services.kick import kick_user_from_chat
 from app.services.notify import notify_fulfillment
 from app.utils import apply_expiry_delta, utcnow
 
 admin_router = Router()
-
-
-def _admin_usernames() -> set[str]:
-    """Parse settings.admin_usernames (comma-separated, optional @) into a lowercase set."""
-    raw = settings.admin_usernames or ""
-    return {
-        u.strip().lstrip("@").lower()
-        for u in raw.split(",")
-        if u.strip()
-    }
+logger = logging.getLogger(__name__)
 
 
 def _is_admin(user) -> bool:
-    """Accepts an aiogram User. Admin if the numeric ID is in admin_ids OR the
-    username is listed in the admin panel's admin_usernames field."""
+    """Admin if numeric Telegram user ID is in admin_ids."""
     if user is None:
         return False
-    if user.id in settings.admin_ids:
-        return True
-    uname = (getattr(user, "username", None) or "").lower()
-    return bool(uname) and uname in _admin_usernames()
+    return user.id in settings.admin_ids
 
 
 @admin_router.message(Command("admin"))
@@ -144,13 +132,17 @@ async def cmd_addplan(message: Message, command: CommandObject):
         await session.commit()
         await message.answer(f"Plan <b>{name}</b> created (id={plan.id}).")
 
-        # Ensure bot is admin in the group
+        # Ensure bot can access the group (same check as admin panel)
         try:
-            await bot.get_chat(chat_id)
-        except Exception:
+            member = await bot.get_chat_member(chat_id, bot.id)
+            if member.status not in ("administrator", "creator"):
+                await message.answer(
+                    "Warning: Bot is not an admin in that chat. "
+                    "Add the bot as admin with invite-link permissions."
+                )
+        except Exception as e:
             await message.answer(
-                "Warning: Could not verify bot is admin in that chat. "
-                "Please add the bot to the group and grant invite-link permissions."
+                f"Warning: Could not verify bot access to chat {chat_id}: {e}"
             )
 
 
@@ -158,7 +150,6 @@ async def cmd_addplan(message: Message, command: CommandObject):
 _PLAN_FIELDS = {
     "name": ("name", str),
     "days": ("duration_days", int),
-    "chat_id": ("chat_id", int),
     "stars": ("price_stars", int),
     "crypto": ("price_crypto", float),
     "stripe": ("price_stripe", int),
@@ -258,13 +249,33 @@ async def cmd_setexpiry(message: Message, command: CommandObject):
             await message.answer("Invalid value. Use +N, -N, or YYYY-MM-DD.")
             return
 
-        sub.last_reminded_at = None  # changed expiry — re-enable reminders
+        sub.last_reminded_at = None
         new_expiry = sub.expires_at
+        chat_id = sub.group_chat_id
         await session.commit()
 
-    expired_note = ""
     if new_expiry <= utcnow():
-        expired_note = "\nNote: new expiry is in the past — user will be kicked at the next hourly check."
+        from sqlalchemy import select
+
+        if await kick_user_from_chat(chat_id, user_id):
+            async with async_session_factory() as session:
+                sub = (
+                    await session.execute(
+                        select(Subscription).where(
+                            Subscription.user_id == user_id,
+                            Subscription.plan_id == plan_id,
+                            Subscription.status == SubscriptionStatus.active,
+                        )
+                    )
+                ).scalars().first()
+                if sub:
+                    sub.status = SubscriptionStatus.kicked
+                    await session.commit()
+            expired_note = "\nUser kicked immediately."
+        else:
+            expired_note = "\nKick failed — will retry on next hourly check."
+    else:
+        expired_note = ""
 
     await message.answer(
         f"User {user_id} subscription expiry set to "
@@ -277,8 +288,8 @@ async def cmd_setexpiry(message: Message, command: CommandObject):
             f"Your subscription expiry has been updated to "
             f"<b>{new_expiry.strftime('%Y-%m-%d %H:%M UTC')}</b>.",
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("setexpiry notify failed user=%d: %s", user_id, e)
 
 
 @admin_router.message(Command("delplan"))
@@ -371,32 +382,13 @@ async def cmd_grant(message: Message, command: CommandObject):
         return
 
     async with async_session_factory() as session:
-        plan = await session.get(Plan, plan_id)
-        if not plan:
-            await message.answer("Plan not found.")
+        try:
+            order = await grant_subscription(session, user_id, plan_id, days)
+            plan = await session.get(Plan, plan_id)
+            await session.commit()
+        except ValueError as e:
+            await message.answer(str(e))
             return
-
-        order = Order(
-            user_id=user_id,
-            plan_id=plan_id,
-            provider=PaymentProvider.stars,
-            amount=0,
-            currency="XTR",
-            status=OrderStatus.paid,
-        )
-        session.add(order)
-        await session.flush()
-
-        sub = Subscription(
-            user_id=user_id,
-            plan_id=plan_id,
-            order_id=order.id,
-            group_chat_id=plan.chat_id,
-            expires_at=utcnow() + timedelta(days=days),
-            status=SubscriptionStatus.active,
-        )
-        session.add(sub)
-        await session.commit()
 
     await message.answer(f"Granted {days} days of <b>{plan.name}</b> to user {user_id}.")
 
@@ -431,14 +423,24 @@ async def cmd_active(message: Message):
         await message.answer("No active subscriptions.")
         return
 
+    plan_ids = {s.plan_id for s in subs}
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+
+        plans = (
+            await session.execute(select(Plan).where(Plan.id.in_(plan_ids)))
+        ).scalars().all()
+    plan_map = {p.id: p for p in plans}
+
     lines = ["<b>Active subscriptions:</b>", ""]
-    for s in subs:
-        async with async_session_factory() as session:
-            plan = await session.get(Plan, s.plan_id)
+    for s in subs[:100]:
+        plan = plan_map.get(s.plan_id)
         lines.append(
             f"  • user={s.user_id} | {plan.name if plan else 'N/A'} "
             f"| expires {s.expires_at.strftime('%Y-%m-%d')}"
         )
+    if len(subs) > 100:
+        lines.append(f"\n… and {len(subs) - 100} more (showing first 100)")
     await message.answer("\n".join(lines))
 
 
@@ -456,6 +458,9 @@ async def cmd_broadcast(message: Message, command: CommandObject):
         user_ids = (await session.execute(select(User.id))).scalars().all()
 
     total = len(user_ids)
+    if total > 5000:
+        await message.answer(f"Broadcast capped at 5000 users (total {total}).")
+        user_ids = user_ids[:5000]
     sent = 0
     failed = 0
     # Telegram allows ~30 msg/s to different users; stay under it.

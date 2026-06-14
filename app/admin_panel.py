@@ -79,6 +79,10 @@ def _save_creds(username: str, password_hash: str) -> None:
     CREDS_FILE.write_text(
         json.dumps({"username": username, "password_hash": password_hash, "changed": True})
     )
+    try:
+        CREDS_FILE.chmod(0o600)
+    except OSError:
+        pass
 
 
 def _verify_login(username: str, password: str) -> bool:
@@ -180,7 +184,9 @@ def _set_session(response: Response, username: str, secure: bool = False) -> str
     return session_id
 
 
-def _clear_session(response: Response) -> None:
+def _clear_session(response: Response, session_id: str | None = None) -> None:
+    if session_id:
+        _sessions.pop(session_id, None)
     response.delete_cookie(SESSION_COOKIE, samesite="strict")
 
 
@@ -396,6 +402,7 @@ CHANGE_PASSWORD_PAGE = """<!DOCTYPE html>
 {flash}
 <div class="sc" style="max-width:480px;">
   <form method="post" action="/admin/change-password">
+    <input type="hidden" name="csrf_token" value="{csrf_token}">
     <div class="frow">
       <label>当前密码</label>
       <input type="password" name="current_password" placeholder="当前密码" required autocomplete="current-password">
@@ -470,6 +477,20 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </div>
 </form>
 {plans_table}
+
+<h2>赠送会员</h2>
+<form method="post" action="/admin/subs/grant" style="margin:0">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<div class="formrow">
+  <span>用户 ID:</span>
+  <input class="w130" name="user_id" type="number" placeholder="Telegram 用户 ID" required>
+  <span>套餐:</span>
+  <select name="plan_id" style="width:180px">{grant_options}</select>
+  <span>天数:</span>
+  <input class="w60" name="days" type="number" min="1" placeholder="天数" required>
+  <button type="submit">赠送</button>
+</div>
+</form>
 
 <h2>会员管理</h2>
 <div class="formrow">
@@ -581,8 +602,9 @@ async def login_submit(request: Request):
 
 @admin_panel_router.get("/admin/logout")
 async def logout(request: Request):
+    session_id = request.cookies.get(SESSION_COOKIE)
     response = RedirectResponse(url="/admin/login", status_code=303)
-    _clear_session(response)
+    _clear_session(response, session_id)
     return response
 
 
@@ -598,9 +620,11 @@ async def change_password_page(request: Request, msg: str = ""):
     flash = ""
     if msg:
         flash = f'<div class="flash warn">{_esc(msg)}</div>'
+    csrf = request.cookies.get(SESSION_COOKIE, "")
     return HTMLResponse(content=CHANGE_PASSWORD_PAGE.format(
         sidebar=_nav_html("change-password", username),
         flash=flash,
+        csrf_token=_esc(csrf),
     ))
 
 
@@ -611,6 +635,11 @@ async def change_password_submit(request: Request):
         return RedirectResponse(url="/admin/login", status_code=303)
 
     form = await request.form()
+    csrf_token = form.get("csrf_token", "")
+    if not _csrf_check(request, csrf_token):
+        return Response(status_code=401)
+
+    csrf = _esc(request.cookies.get(SESSION_COOKIE, ""))
     current = form.get("current_password", "")
     new_pwd = form.get("new_password", "")
     confirm = form.get("confirm_password", "")
@@ -620,6 +649,7 @@ async def change_password_submit(request: Request):
             content=CHANGE_PASSWORD_PAGE.format(
                 sidebar=_nav_html("change-password", username),
                 flash='<div class="flash err">表单数据无效</div>',
+                csrf_token=csrf,
             ),
             status_code=400,
         )
@@ -629,6 +659,7 @@ async def change_password_submit(request: Request):
             content=CHANGE_PASSWORD_PAGE.format(
                 sidebar=_nav_html("change-password", username),
                 flash='<div class="flash err">当前密码不正确</div>',
+                csrf_token=csrf,
             ),
             status_code=401,
         )
@@ -638,6 +669,7 @@ async def change_password_submit(request: Request):
             content=CHANGE_PASSWORD_PAGE.format(
                 sidebar=_nav_html("change-password", username),
                 flash='<div class="flash err">新密码至少 8 位</div>',
+                csrf_token=csrf,
             ),
             status_code=400,
         )
@@ -647,6 +679,7 @@ async def change_password_submit(request: Request):
             content=CHANGE_PASSWORD_PAGE.format(
                 sidebar=_nav_html("change-password", username),
                 flash='<div class="flash err">两次输入的新密码不一致</div>',
+                csrf_token=csrf,
             ),
             status_code=400,
         )
@@ -656,6 +689,7 @@ async def change_password_submit(request: Request):
             content=CHANGE_PASSWORD_PAGE.format(
                 sidebar=_nav_html("change-password", username),
                 flash='<div class="flash err">新密码不能与当前密码相同</div>',
+                csrf_token=csrf,
             ),
             status_code=400,
         )
@@ -666,6 +700,7 @@ async def change_password_submit(request: Request):
         content=CHANGE_PASSWORD_PAGE.format(
             sidebar=_nav_html("change-password", username),
             flash='<div class="flash">密码修改成功！<a href="/admin" style="color:var(--accent)">进入管理后台</a></div>',
+            csrf_token=csrf,
         )
     )
 
@@ -752,7 +787,8 @@ async def admin_dashboard(request: Request):
         ).scalars().all()
 
         sub_stmt = select(Subscription).where(
-            Subscription.status == SubscriptionStatus.active
+            Subscription.status == SubscriptionStatus.active,
+            Subscription.expires_at > utcnow(),
         )
         if q:
             try:
@@ -871,6 +907,11 @@ async def admin_dashboard(request: Request):
     else:
         orders_table = '<table><tr><td class="empty">暂无订单</td></tr></table>'
 
+    grant_options = "".join(
+        f'<option value="{p.id}">{_esc(p.name)} (ID:{p.id}, {p.duration_days}天)</option>'
+        for p in plans if p.is_active
+    ) or '<option value="">无可用套餐</option>'
+
     page = PAGE_TEMPLATE.format(
         generated_at=utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         sidebar=_nav_html("dashboard", username),
@@ -884,6 +925,7 @@ async def admin_dashboard(request: Request):
         revenue_cards=revenue_cards,
         provider_table=provider_table,
         plans_table=plans_table,
+        grant_options=grant_options,
         subs_table=subs_table,
         orders_table=orders_table,
     )
@@ -1007,6 +1049,39 @@ async def plan_toggle(
     return _redirect(f"套餐 #{plan_id} {state}")
 
 
+@admin_panel_router.post("/admin/subs/grant")
+async def sub_grant(
+    request: Request,
+    csrf_token: str = Form(""),
+    user_id: int = Form(...),
+    plan_id: int = Form(...),
+    days: int = Form(...),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+
+    async with async_session_factory() as session:
+        try:
+            from app.services.grant import grant_subscription
+
+            order = await grant_subscription(session, user_id, plan_id, days)
+            plan = await session.get(Plan, plan_id)
+            await session.commit()
+        except ValueError as e:
+            return _redirect(str(e), err=True)
+
+    from app.services.notify import notify_fulfillment
+
+    link = await notify_fulfillment(order.id)
+    plan_name = plan.name if plan else str(plan_id)
+    if not link:
+        return _redirect(
+            f"会员已赠送,但邀请链接创建失败——请确保机器人是该群管理员",
+            err=True,
+        )
+    return _redirect(f"已赠送 {days} 天「{plan_name}」给用户 {user_id}，邀请链接已发送")
+
+
 # ---------------------------------------------------------------- sub actions
 
 
@@ -1029,10 +1104,21 @@ async def sub_adjust(
             sub.expires_at = apply_expiry_delta(sub.expires_at, delta)
         except ValueError:
             return _redirect("无效的调整值,用 +7 / -3 / YYYY-MM-DD", err=True)
-        sub.last_reminded_at = None  # changed expiry — re-enable reminders
+        sub.last_reminded_at = None
         new_expiry = sub.expires_at
         user_id = sub.user_id
+        chat_id = sub.group_chat_id
         await session.commit()
+
+    if new_expiry <= utcnow():
+        from app.services.kick import kick_user_from_chat
+
+        async with async_session_factory() as session:
+            sub = await session.get(Subscription, sub_id)
+            if sub:
+                if await kick_user_from_chat(chat_id, user_id):
+                    sub.status = SubscriptionStatus.kicked
+                await session.commit()
 
     try:
         from app.bot.dispatcher import bot
@@ -1042,8 +1128,8 @@ async def sub_adjust(
             f"Your subscription expiry has been updated to "
             f"<b>{new_expiry.strftime('%Y-%m-%d %H:%M UTC')}</b>.",
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Adjust expiry notify failed user=%d: %s", user_id, e)
 
     return _redirect(f"用户 {user_id} 到期时间已调整为 {new_expiry.strftime('%Y-%m-%d %H:%M')}")
 
@@ -1145,7 +1231,8 @@ def _render_settings_form(config: dict, csrf_token: str) -> str:
             checked = "checked" if str(val).lower() in ("true", "on", "1", "yes") else ""
             return (
                 f'<tr><td style="width:140px">{_esc(label)}</td>'
-                f'<td><label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">'
+                f'<td><input type="hidden" name="{_esc(key)}" value="off">'
+                f'<label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">'
                 f'<input type="checkbox" name="{_esc(key)}" value="on" {checked}> 启用'
                 f'</label></td></tr>'
             )
@@ -1161,10 +1248,11 @@ def _render_settings_form(config: dict, csrf_token: str) -> str:
                 f'<td><select name="{_esc(key)}" style="width:180px">{sel_html}</select></td></tr>'
             )
         if ftype == "password":
+            hint = f"{_esc(placeholder)}（留空保持不变）" if placeholder else "留空保持不变"
             return (
                 f'<tr><td style="width:140px">{_esc(label)}</td>'
-                f'<td><input type="password" name="{_esc(key)}" value="{_esc(val)}" '
-                f'placeholder="{_esc(placeholder)}" style="width:360px"></td></tr>'
+                f'<td><input type="password" name="{_esc(key)}" value="" '
+                f'placeholder="{hint}" style="width:360px" autocomplete="new-password"></td></tr>'
             )
         return (
             f'<tr><td style="width:140px">{_esc(label)}</td>'
@@ -1293,8 +1381,8 @@ BOT_CONFIG_PAGE = """<!DOCTYPE html>
 
   <div class="frow">
     <label>Bot Token <span class="req">*</span></label>
-    <input type="text" name="bot_token" value="{bot_token}"
-      placeholder="从 @BotFather 获取的机器人Token">
+    <input type="password" name="bot_token" value=""
+      placeholder="留空保持不变；修改后需重启服务" autocomplete="new-password">
     <div class="fhint" style="color:var(--orange)">⚠️ 修改 Bot Token 后需<strong>重启服务</strong>才会生效（其余配置即时生效）</div>
   </div>
 
@@ -1359,7 +1447,7 @@ def _render_bot_config_page(cfg: dict, username: str, csrf_token: str, flash: st
         sidebar=_nav_html("bot-config", username),
         flash=flash,
         csrf_token=_esc(csrf_token),
-        bot_token=_esc(cfg.get("bot_token", "")),
+        bot_token="",
         usdt_rate=_esc(cfg.get("usdt_rate", "7.20")),
         admin_usernames=_esc(cfg.get("admin_usernames", "")),
         welcome_message=_esc(cfg.get("welcome_message", "")),
