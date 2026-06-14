@@ -1,0 +1,13 @@
+aiogram>=3.15,<4
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32,<1
+sqlalchemy[asyncio]>=2.0,<3
+alembic>=1.14,<2
+aiosqlite>=0.20,<1
+apscheduler>=3.10,<4
+pydantic>=2.10,<3
+pydantic-settings>=2.6,<3
+httpx>=0.28,<1
+stripe>=10,<12
+python-dotenv>=1.0,<2
+python-multipart>=0.0.12,<1

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-journal
+*.db-wal
+.env
+*.egg-info/
+dist/
+.venv/
+venv/
+data/admin_creds.json
+data/payment_config.json
+data/bot_config.json
+.pycache/

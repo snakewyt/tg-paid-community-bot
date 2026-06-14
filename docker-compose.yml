@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    container_name: tg-paid-community-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - bot_data:/app/data
+    ports:
+      - "${WEBHOOK_PORT:-8000}:${WEBHOOK_PORT:-8000}"
+
+volumes:
+  bot_data:

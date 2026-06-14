@@ -1,0 +1,1360 @@
+"""Admin web panel: data dashboard + management backend.
+
+Embedded in the existing FastAPI webhook service. Management actions:
+plan create/edit/toggle, subscription search/extend/revoke, order browsing.
+
+Auth: username + password login page → session cookie (HttpOnly, SameSite).
+Default credentials: admin / 123456. First login forces password change;
+the new password is persisted to data/admin_creds.json (PBKDF2 hashed).
+
+CSRF: session cookie with SameSite=Strict, plus a hidden csrf_token field
+in all POST forms that must match the session cookie value (defence in depth).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import html
+import json
+import logging
+import secrets
+import time
+from datetime import timedelta
+from pathlib import Path
+
+from fastapi import APIRouter, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from sqlalchemy import func, select
+
+from app.config import settings
+from app.constants import PROVIDER_LABELS
+from app.database import async_session_factory
+from app.models.models import (
+    Order,
+    OrderStatus,
+    Plan,
+    Subscription,
+    SubscriptionStatus,
+    User,
+)
+from app.utils import apply_expiry_delta, utcnow
+
+logger = logging.getLogger(__name__)
+admin_panel_router = APIRouter()
+
+SESSION_COOKIE = "admin_session"
+SESSION_MAX_AGE = 24 * 3600  # 24 hours
+
+CREDS_FILE = Path("data/admin_creds.json")
+
+# ----------------------------------------------------------------- credential store
+# Credentials are read from data/admin_creds.json if it exists, otherwise
+# from the .env-driven settings (default: admin / 123456).
+# After the first password change the hashed password is persisted to disk.
+
+
+def _hash_password(password: str, username: str) -> str:
+    """PBKDF2-HMAC-SHA256 with the username as salt."""
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), username.encode(), 100_000).hex()
+
+
+def _load_creds() -> tuple[str, str, bool]:
+    """Return (username, password_hash, password_changed).
+
+    Reads from CREDS_FILE if it exists, otherwise falls back to env defaults
+    with password_changed=False.
+    """
+    try:
+        data = json.loads(CREDS_FILE.read_text())
+        return data["username"], data["password_hash"], data.get("changed", True)
+    except Exception:
+        username = settings.admin_panel_username
+        pwd = settings.admin_panel_password
+        return username, _hash_password(pwd, username), False
+
+
+def _save_creds(username: str, password_hash: str) -> None:
+    """Persist credentials to disk."""
+    CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CREDS_FILE.write_text(
+        json.dumps({"username": username, "password_hash": password_hash, "changed": True})
+    )
+
+
+def _verify_login(username: str, password: str) -> bool:
+    """Check username/password against current stored credentials."""
+    stored_user, stored_hash, _ = _load_creds()
+    user_ok = secrets.compare_digest(username, stored_user)
+    pwd_ok = secrets.compare_digest(_hash_password(password, stored_user), stored_hash)
+    return user_ok and pwd_ok
+
+
+def _password_changed() -> bool:
+    _, _, changed = _load_creds()
+    return changed
+
+
+# ----------------------------------------------------------------- in-memory state
+
+# In-memory session store: session_id → (username, expiry_timestamp)
+_sessions: dict[str, tuple[str, float]] = {}
+
+# Rate limiting: IP → [attempt_timestamps]
+_login_attempts: dict[str, list[float]] = {}
+
+SESSION_CLEANUP_INTERVAL = 600  # seconds between stale-entry sweeps
+
+
+def _cleanup_stale_entries() -> int:
+    """Remove expired sessions and stale rate-limit entries.
+    Called periodically from the scheduler to prevent unbounded growth.
+    Returns the number of entries removed.
+    """
+    now = time.time()
+    removed = 0
+
+    # Expired sessions
+    stale_sids = [
+        sid for sid, (_, exp) in _sessions.items() if now > exp
+    ]
+    for sid in stale_sids:
+        _sessions.pop(sid, None)
+        removed += 1
+
+    # Rate-limit entries with no recent attempts
+    stale_ips = [
+        ip for ip, ts in _login_attempts.items()
+        if not any(now - t < 60 for t in ts)
+    ]
+    for ip in stale_ips:
+        _login_attempts.pop(ip, None)
+        removed += 1
+
+    if removed:
+        logger.debug("Cleaned up %d stale in-memory entries", removed)
+    return removed
+
+def _check_login_rate(ip: str) -> bool:
+    """Return False if IP has made >5 login attempts in the last 60s."""
+    now = time.time()
+    attempts = [t for t in _login_attempts.get(ip, []) if now - t < 60]
+    _login_attempts[ip] = attempts
+    if len(attempts) >= 5:
+        return False
+    _login_attempts[ip].append(now)
+    return True
+
+
+def _get_session(request: Request) -> str | None:
+    """Return username if the session cookie is valid, else None.
+
+    Extends session expiry on valid access.
+    """
+    session_id = request.cookies.get(SESSION_COOKIE)
+    if not session_id:
+        return None
+    entry = _sessions.get(session_id)
+    if not entry:
+        return None
+    username, expires_at = entry
+    if time.time() > expires_at:
+        _sessions.pop(session_id, None)
+        return None
+    # Extend session
+    _sessions[session_id] = (username, time.time() + SESSION_MAX_AGE)
+    return username
+
+
+def _set_session(response: Response, username: str, secure: bool = False) -> str:
+    """Create a new session, set the HttpOnly cookie, and return the session id."""
+    session_id = secrets.token_urlsafe(32)
+    _sessions[session_id] = (username, time.time() + SESSION_MAX_AGE)
+    response.set_cookie(
+        SESSION_COOKIE,
+        session_id,
+        httponly=True,
+        max_age=SESSION_MAX_AGE,
+        samesite="strict",
+        secure=secure,
+    )
+    return session_id
+
+
+def _clear_session(response: Response) -> None:
+    response.delete_cookie(SESSION_COOKIE, samesite="strict")
+
+
+def _csrf_check(request: Request, form_csrf: str) -> bool:
+    """Verify that the hidden csrf_token matches the session cookie."""
+    session_id = request.cookies.get(SESSION_COOKIE)
+    if not session_id or not form_csrf:
+        return False
+    return secrets.compare_digest(session_id, form_csrf)
+
+
+def _redirect(msg: str, err: bool = False) -> RedirectResponse:
+    flag = "err" if err else "ok"
+    return RedirectResponse(url=f"/admin?msg={msg}&t={flag}", status_code=303)
+
+
+# ---------------------------------------------------------------------- styles
+# Shared CSS block. Kept separate so each template can include it.
+# NOTE: braces are doubled ({{}}) so Python .format() leaves them as single { }.
+
+_STYLES = """<style>
+  :root {{
+    --bg: #0f1419; --card: #1a2129; --border: #2a3441;
+    --text: #e6edf3; --muted: #8b98a5; --accent: #4f9cf9;
+    --green: #3fb950; --red: #f85149; --orange: #d29922;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", sans-serif;
+    padding: 24px; max-width: 1400px; margin: 0 auto;
+    min-height: 100vh;
+  }}
+  h1 {{ font-size: 22px; margin-bottom: 4px; }}
+  .sub {{ color: var(--muted); font-size: 13px; margin-bottom: 20px; }}
+  .flash {{ background: rgba(63,185,80,.12); border: 1px solid var(--green);
+    color: var(--green); border-radius: 8px; padding: 10px 14px; margin-bottom: 18px; font-size: 13px; }}
+  .flash.err {{ background: rgba(248,81,73,.12); border-color: var(--red); color: var(--red); }}
+  .flash.warn {{ background: rgba(210,153,34,.12); border-color: var(--orange); color: var(--orange); }}
+  .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 26px; }}
+  .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }}
+  .card .label {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }}
+  .card .value {{ font-size: 24px; font-weight: 600; margin-top: 6px; }}
+  h2 {{ font-size: 15px; margin: 26px 0 10px; color: var(--accent); }}
+  table {{ width: 100%; border-collapse: collapse; background: var(--card); border-radius: 10px; overflow: hidden; font-size: 13px; }}
+  th {{ text-align: left; padding: 9px 12px; background: #212a35; color: var(--muted); font-weight: 500; white-space: nowrap; }}
+  td {{ padding: 8px 12px; border-top: 1px solid var(--border); vertical-align: middle; }}
+  .tag {{ display: inline-block; padding: 1px 8px; border-radius: 20px; font-size: 11px; }}
+  .tag.active, .tag.fulfilled {{ background: rgba(63,185,80,.15); color: var(--green); }}
+  .tag.inactive, .tag.expired, .tag.kicked, .tag.cancelled {{ background: rgba(139,152,165,.15); color: var(--muted); }}
+  .tag.pending, .tag.paid {{ background: rgba(79,156,249,.15); color: var(--accent); }}
+  .empty {{ color: var(--muted); padding: 16px; text-align: center; }}
+  form.inline {{ display: inline-flex; gap: 4px; align-items: center; margin: 0; }}
+  input, select, button {{
+    background: #212a35; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font-size: 12px;
+  }}
+  input:focus, select:focus {{ outline: 1px solid var(--accent); }}
+  button {{ cursor: pointer; color: var(--accent); border-color: var(--accent); background: transparent; white-space: nowrap; }}
+  button:hover {{ background: rgba(79,156,249,.12); }}
+  button.danger {{ color: var(--red); border-color: var(--red); }}
+  button.danger:hover {{ background: rgba(248,81,73,.12); }}
+  .formrow {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px; margin-bottom: 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+  .formrow span {{ color: var(--muted); font-size: 12px; }}
+  .w60 {{ width: 60px; }} .w80 {{ width: 80px; }} .w90 {{ width: 90px; }} .w130 {{ width: 130px; }} .w160 {{ width: 160px; }}
+
+  /* Login / Change-password page */
+  .login-wrap {{
+    display: flex; align-items: center; justify-content: center; min-height: 100vh;
+  }}
+  .login-box {{
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 40px 36px; width: 100%; max-width: 380px;
+  }}
+  .login-box h1 {{ text-align: center; margin-bottom: 8px; }}
+  .login-box .sub {{ text-align: center; margin-bottom: 24px; }}
+  .login-box input {{
+    display: block; width: 100%; padding: 10px; margin-bottom: 12px;
+    font-size: 14px; border-radius: 8px;
+  }}
+  .login-box button {{
+    display: block; width: 100%; padding: 10px; font-size: 14px;
+    border-radius: 8px; margin-top: 4px;
+  }}
+  .login-box .hint {{
+    color: var(--muted); font-size: 11px; margin-bottom: 12px; text-align: center;
+  }}
+
+  /* Header bar */
+  .header {{
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 20px; flex-wrap: wrap; gap: 8px;
+  }}
+  .header .right {{ color: var(--muted); font-size: 13px; }}
+  .header .right a {{ color: var(--accent); text-decoration: none; margin-left: 12px; }}
+  .header .right a.logout {{ color: var(--red); }}
+  .header .right a:hover {{ text-decoration: underline; }}
+
+  /* ── Sidebar layout ── */
+  body.layout-body {{ padding: 0; max-width: none; }}
+  .layout {{ display: flex; min-height: 100vh; }}
+  .sidebar {{
+    width: 220px; min-width: 220px; background: #1e1b4b;
+    display: flex; flex-direction: column;
+    border-right: 1px solid rgba(255,255,255,.08);
+  }}
+  .sidebar-brand {{
+    padding: 20px 16px 16px;
+    border-bottom: 1px solid rgba(255,255,255,.1);
+  }}
+  .brand-title {{
+    font-size: 15px; font-weight: 700; color: #fff; line-height: 1.3;
+  }}
+  .brand-sub {{ font-size: 11px; color: rgba(255,255,255,.45); margin-top: 2px; }}
+  .brand-user {{ font-size: 12px; color: rgba(255,255,255,.65); margin-top: 8px; }}
+  .sidebar-nav {{
+    flex: 1; padding: 8px 0; display: flex; flex-direction: column;
+  }}
+  .nav-item {{
+    display: flex; align-items: center; gap: 10px;
+    padding: 11px 18px; color: rgba(255,255,255,.7);
+    text-decoration: none; font-size: 13px;
+    transition: background .15s; border-left: 3px solid transparent;
+  }}
+  .nav-item:hover {{ background: rgba(255,255,255,.08); color: #fff; }}
+  .nav-item.active {{
+    background: rgba(255,255,255,.13); color: #fff; font-weight: 500;
+    border-left-color: var(--accent);
+  }}
+  .nav-item.nav-logout {{ color: #f85149; margin-top: auto; }}
+  .nav-item.nav-logout:hover {{ background: rgba(248,81,73,.1); }}
+  .nav-icon {{ width: 18px; text-align: center; }}
+  .main-content {{ flex: 1; padding: 28px 32px; overflow: auto; min-width: 0; }}
+  .page-hdr {{ margin-bottom: 22px; }}
+  .page-hdr h1 {{ font-size: 20px; margin-bottom: 4px; }}
+
+  /* ── Bot-config form cards ── */
+  .sc {{
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 24px; margin-bottom: 20px;
+  }}
+  .sc > h2 {{
+    font-size: 14px; font-weight: 600; color: var(--accent);
+    margin: 0 0 18px; display: flex; align-items: center; gap: 8px;
+  }}
+  .frow {{ margin-bottom: 16px; }}
+  .frow label {{
+    display: block; font-size: 13px; font-weight: 500;
+    margin-bottom: 5px; color: var(--text);
+  }}
+  .frow .req {{ color: var(--red); }}
+  .frow input[type=text], .frow input[type=number],
+  .frow input[type=password], .frow textarea {{
+    width: 100%; max-width: 500px; padding: 9px 12px; font-size: 13px;
+    border-radius: 8px; background: #212a35; color: var(--text);
+    border: 1px solid var(--border); display: block;
+  }}
+  .frow input:focus, .frow textarea:focus {{ outline: 1px solid var(--accent); }}
+  .frow textarea {{ resize: vertical; min-height: 88px; font-family: inherit; line-height: 1.5; }}
+  .fhint {{ font-size: 11px; color: var(--muted); margin-top: 4px; }}
+  .btn-save {{
+    background: var(--accent); color: #fff; border: none;
+    padding: 10px 36px; font-size: 14px; border-radius: 8px;
+    cursor: pointer; font-weight: 500;
+  }}
+  .btn-save:hover {{ background: #3d8de8; }}
+</style>"""
+
+# ----------------------------------------------------------------- login page
+
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Login</title>
+""" + _STYLES + """
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-box">
+    <h1>管理后台</h1>
+    <p class="sub">请输入用户名和密码</p>
+    {flash}
+    <form method="post" action="/admin/login">
+      <input type="text" name="username" placeholder="用户名" required autocomplete="username">
+      <input type="password" name="password" placeholder="密码" required autocomplete="current-password">
+      <button type="submit">登录</button>
+    </form>
+  </div>
+</div>
+</body>
+</html>"""
+
+# ---------------------------------------------------------- change password page
+
+CHANGE_PASSWORD_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>修改密码 — 管理后台</title>
+""" + _STYLES + """
+</head>
+<body class="layout-body">
+<div class="layout">
+{sidebar}
+<main class="main-content">
+<div class="page-hdr"><h1>修改管理员密码</h1></div>
+{flash}
+<div class="sc" style="max-width:480px;">
+  <form method="post" action="/admin/change-password">
+    <div class="frow">
+      <label>当前密码</label>
+      <input type="password" name="current_password" placeholder="当前密码" required autocomplete="current-password">
+    </div>
+    <div class="frow">
+      <label>新密码 <span class="req">*</span></label>
+      <input type="password" name="new_password" placeholder="新密码（至少8位）" required minlength="8" autocomplete="new-password">
+    </div>
+    <div class="frow">
+      <label>确认新密码 <span class="req">*</span></label>
+      <input type="password" name="confirm_password" placeholder="确认新密码" required minlength="8" autocomplete="new-password">
+    </div>
+    <div class="fhint" style="margin-bottom:16px;">密码修改后将写入服务器配置文件，不会丢失。</div>
+    <button class="btn-save" type="submit">修改密码</button>
+  </form>
+</div>
+</main>
+</div>
+</body>
+</html>"""
+
+# ---------------------------------------------------------------- dashboard
+
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>管理后台 — 首页</title>
+""" + _STYLES + """
+</head>
+<body class="layout-body">
+<div class="layout">
+{sidebar}
+<main class="main-content">
+<div class="page-hdr">
+  <h1>管理后台</h1>
+  <div class="sub">{generated_at} UTC · 数据实时</div>
+</div>
+{flash}
+
+<div class="cards">
+  <div class="card"><div class="label">总用户</div><div class="value">{total_users}</div></div>
+  <div class="card"><div class="label">活跃会员</div><div class="value">{active_subs}</div></div>
+  <div class="card"><div class="label">已完成订单</div><div class="value">{fulfilled_orders}</div></div>
+  <div class="card"><div class="label">近 7 天新订单</div><div class="value">{orders_7d}</div></div>
+  {revenue_cards}
+</div>
+
+<h2>收入按支付渠道</h2>
+{provider_table}
+
+<h2>套餐管理</h2>
+<form method="post" action="/admin/plans/create" style="margin:0">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<div class="formrow" style="flex-direction:column;align-items:stretch;gap:10px">
+  <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+    <span>新增套餐:</span>
+    <input class="w130" name="name" placeholder="名称" required>
+    <input class="w60" name="duration_days" type="number" min="1" placeholder="天数" required>
+    <input class="w160" name="chat_id" placeholder="群/频道 chat_id" required title="创建后不可修改">
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+    <span style="color:var(--muted);font-size:12px">价格 (填0=不启用该渠道):</span>
+    <span style="font-size:12px;color:var(--muted)">Stars:</span><input class="w60" name="price_stars" type="number" placeholder="XTR" value="0">
+    <span style="font-size:12px;color:var(--muted)">USDT:</span><input class="w60" name="price_crypto" type="number" step="0.01" placeholder="USDT" value="0">
+    <span style="font-size:12px;color:var(--muted)">Stripe美分:</span><input class="w60" name="price_stripe" type="number" placeholder="美分" value="0">
+    <span style="font-size:12px;color:var(--muted)">支付宝CNY:</span><input class="w80" name="price_alipay" type="number" step="0.01" placeholder="¥" value="0">
+    <span style="font-size:12px;color:var(--muted)">微信CNY:</span><input class="w80" name="price_wechat" type="number" step="0.01" placeholder="¥" value="0">
+    <button type="submit">创建套餐</button>
+  </div>
+</div>
+</form>
+{plans_table}
+
+<h2>会员管理</h2>
+<div class="formrow">
+  <form class="inline" method="get" action="/admin">
+    <span>搜索用户:</span>
+    <input class="w130" name="q" placeholder="Telegram 用户 ID" value="{q}">
+    <button type="submit">搜索</button>
+  </form>
+</div>
+{subs_table}
+
+<h2>最近订单</h2>
+{orders_table}
+
+</main>
+</div>
+</body>
+</html>"""
+
+
+def _esc(v) -> str:
+    return html.escape(str(v if v is not None else ""))
+
+
+_NAV_ITEMS = [
+    ("dashboard", "/admin", "📊", "首页"),
+    ("bot-config", "/admin/bot-config", "⚙️", "机器人配置"),
+    ("settings", "/admin/settings", "💳", "支付设置"),
+    ("change-password", "/admin/change-password", "🔒", "修改密码"),
+]
+
+
+def _nav_html(active: str, username: str) -> str:
+    """Build the sidebar navigation HTML block."""
+    items = ""
+    for k, url, icon, label in _NAV_ITEMS:
+        cls = " active" if k == active else ""
+        items += (
+            f'<a class="nav-item{cls}" href="{url}">'
+            f'<span class="nav-icon">{icon}</span>{_esc(label)}</a>'
+        )
+    items += (
+        '<a class="nav-item nav-logout" href="/admin/logout">'
+        '<span class="nav-icon">🚪</span>退出登录</a>'
+    )
+    return (
+        '<aside class="sidebar">'
+        '<div class="sidebar-brand">'
+        '<div class="brand-title">VIP 付费社群</div>'
+        '<div class="brand-sub">管理系统</div>'
+        f'<div class="brand-user">👤 {_esc(username)}</div>'
+        '</div>'
+        f'<nav class="sidebar-nav">{items}</nav>'
+        '</aside>'
+    )
+
+
+# ---------------------------------------------------------------- login / logout
+
+
+@admin_panel_router.get("/admin/login", response_class=HTMLResponse)
+async def login_page(request: Request, msg: str = ""):
+    if _get_session(request):
+        return RedirectResponse(url="/admin", status_code=303)
+
+    flash = ""
+    if msg:
+        flash = f'<div class="flash err">{_esc(msg)}</div>'
+
+    return HTMLResponse(content=LOGIN_PAGE.format(flash=flash))
+
+
+@admin_panel_router.post("/admin/login", response_class=HTMLResponse)
+async def login_submit(request: Request):
+    ip = request.client.host if request.client else "0.0.0.0"
+    if not _check_login_rate(ip):
+        return HTMLResponse(
+            content=LOGIN_PAGE.format(flash='<div class="flash err">登录尝试过于频繁，请 60 秒后重试</div>'),
+            status_code=429,
+        )
+
+    form = await request.form()
+    username = form.get("username", "")
+    password = form.get("password", "")
+
+    if not isinstance(username, str) or not isinstance(password, str):
+        return HTMLResponse(
+            content=LOGIN_PAGE.format(flash='<div class="flash err">用户名或密码错误</div>'),
+            status_code=401,
+        )
+
+    if not _verify_login(username, password):
+        return HTMLResponse(
+            content=LOGIN_PAGE.format(flash='<div class="flash err">用户名或密码错误</div>'),
+            status_code=401,
+        )
+
+    secure = request.headers.get("X-Forwarded-Proto", "http") == "https"
+    if not _password_changed():
+        response = RedirectResponse(
+            url="/admin/change-password?msg=首次登录，请修改默认密码",
+            status_code=303,
+        )
+    else:
+        response = RedirectResponse(url="/admin", status_code=303)
+    _set_session(response, username, secure=secure)
+    return response
+
+
+@admin_panel_router.get("/admin/logout")
+async def logout(request: Request):
+    response = RedirectResponse(url="/admin/login", status_code=303)
+    _clear_session(response)
+    return response
+
+
+# ---------------------------------------------------------------- change password
+
+
+@admin_panel_router.get("/admin/change-password", response_class=HTMLResponse)
+async def change_password_page(request: Request, msg: str = ""):
+    username = _get_session(request)
+    if not username:
+        return RedirectResponse(url="/admin/login", status_code=303)
+
+    flash = ""
+    if msg:
+        flash = f'<div class="flash warn">{_esc(msg)}</div>'
+    return HTMLResponse(content=CHANGE_PASSWORD_PAGE.format(
+        sidebar=_nav_html("change-password", username),
+        flash=flash,
+    ))
+
+
+@admin_panel_router.post("/admin/change-password", response_class=HTMLResponse)
+async def change_password_submit(request: Request):
+    username = _get_session(request)
+    if not username:
+        return RedirectResponse(url="/admin/login", status_code=303)
+
+    form = await request.form()
+    current = form.get("current_password", "")
+    new_pwd = form.get("new_password", "")
+    confirm = form.get("confirm_password", "")
+
+    if not isinstance(current, str) or not isinstance(new_pwd, str) or not isinstance(confirm, str):
+        return HTMLResponse(
+            content=CHANGE_PASSWORD_PAGE.format(
+                sidebar=_nav_html("change-password", username),
+                flash='<div class="flash err">表单数据无效</div>',
+            ),
+            status_code=400,
+        )
+
+    if not _verify_login(username, current):
+        return HTMLResponse(
+            content=CHANGE_PASSWORD_PAGE.format(
+                sidebar=_nav_html("change-password", username),
+                flash='<div class="flash err">当前密码不正确</div>',
+            ),
+            status_code=401,
+        )
+
+    if len(new_pwd) < 8:
+        return HTMLResponse(
+            content=CHANGE_PASSWORD_PAGE.format(
+                sidebar=_nav_html("change-password", username),
+                flash='<div class="flash err">新密码至少 8 位</div>',
+            ),
+            status_code=400,
+        )
+
+    if new_pwd != confirm:
+        return HTMLResponse(
+            content=CHANGE_PASSWORD_PAGE.format(
+                sidebar=_nav_html("change-password", username),
+                flash='<div class="flash err">两次输入的新密码不一致</div>',
+            ),
+            status_code=400,
+        )
+
+    if secrets.compare_digest(current, new_pwd):
+        return HTMLResponse(
+            content=CHANGE_PASSWORD_PAGE.format(
+                sidebar=_nav_html("change-password", username),
+                flash='<div class="flash err">新密码不能与当前密码相同</div>',
+            ),
+            status_code=400,
+        )
+
+    _save_creds(username, _hash_password(new_pwd, username))
+
+    return HTMLResponse(
+        content=CHANGE_PASSWORD_PAGE.format(
+            sidebar=_nav_html("change-password", username),
+            flash='<div class="flash">密码修改成功！<a href="/admin" style="color:var(--accent)">进入管理后台</a></div>',
+        )
+    )
+
+
+# ---------------------------------------------------------------- dashboard
+
+
+@admin_panel_router.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(request: Request):
+    username = _get_session(request)
+    if not username:
+        return RedirectResponse(url="/admin/login", status_code=303)
+
+    if not _password_changed():
+        return RedirectResponse(
+            url="/admin/change-password?msg=首次登录，请修改默认密码",
+            status_code=303,
+        )
+
+    q = request.query_params.get("q", "").strip()
+    msg = request.query_params.get("msg", "")
+    msg_type = request.query_params.get("t", "ok")
+
+    async with async_session_factory() as session:
+        total_users = (
+            await session.execute(select(func.count()).select_from(User))
+        ).scalar() or 0
+
+        active_subs_count = (
+            await session.execute(
+                select(func.count()).where(
+                    Subscription.status == SubscriptionStatus.active,
+                    Subscription.expires_at > utcnow(),
+                )
+            )
+        ).scalar() or 0
+
+        fulfilled_count = (
+            await session.execute(
+                select(func.count()).where(Order.status == OrderStatus.fulfilled)
+            )
+        ).scalar() or 0
+
+        # Revenue by currency – SQL aggregation
+        revenue_by_currency: dict[str, float] = {}
+        currency_rows = (
+            await session.execute(
+                select(Order.currency, func.sum(Order.amount))
+                .where(Order.status == OrderStatus.fulfilled, Order.amount > 0)
+                .group_by(Order.currency)
+            )
+        ).all()
+        for currency, total in currency_rows:
+            revenue_by_currency[currency] = float(total or 0)
+
+        # Revenue by provider + currency – SQL aggregation
+        revenue_by_provider: dict[str, dict[str, float]] = {}
+        provider_rows = (
+            await session.execute(
+                select(Order.provider, Order.currency, func.sum(Order.amount))
+                .where(Order.status == OrderStatus.fulfilled, Order.amount > 0)
+                .group_by(Order.provider, Order.currency)
+            )
+        ).all()
+        for provider, currency, total in provider_rows:
+            prov_key = provider.value if hasattr(provider, 'value') else str(provider)
+            sub = revenue_by_provider.setdefault(prov_key, {})
+            sub[currency] = float(total or 0)
+
+        orders_7d = (
+            await session.execute(
+                select(func.count()).where(
+                    Order.created_at >= utcnow() - timedelta(days=7),
+                )
+            )
+        ).scalar() or 0
+
+        plans = (await session.execute(select(Plan))).scalars().all()
+
+        recent_orders = (
+            await session.execute(
+                select(Order).order_by(Order.created_at.desc()).limit(20)
+            )
+        ).scalars().all()
+
+        sub_stmt = select(Subscription).where(
+            Subscription.status == SubscriptionStatus.active
+        )
+        if q:
+            try:
+                sub_stmt = sub_stmt.where(Subscription.user_id == int(q))
+            except ValueError:
+                pass
+        subs = (
+            (await session.execute(sub_stmt.order_by(Subscription.expires_at).limit(50)))
+            .scalars()
+            .all()
+        )
+
+    plan_names = {p.id: p.name for p in plans}
+    csrf_token = request.cookies.get(SESSION_COOKIE, "")
+
+    flash = ""
+    if msg:
+        cls = "flash err" if msg_type == "err" else "flash"
+        flash = f'<div class="{cls}">{_esc(msg)}</div>'
+
+    revenue_cards = "".join(
+        f'<div class="card"><div class="label">收入 {_esc(cur)}</div>'
+        f'<div class="value">{amt:,.2f}</div></div>'
+        for cur, amt in sorted(revenue_by_currency.items())
+    )
+
+    if revenue_by_provider:
+        rows = "".join(
+            f"<tr><td>{_esc(PROVIDER_LABELS.get(prov, prov))}</td>"
+            f"<td>{', '.join(f'{amt:,.2f} {_esc(cur)}' for cur, amt in currencies.items())}</td></tr>"
+            for prov, currencies in revenue_by_provider.items()
+        )
+        provider_table = f"<table><tr><th>渠道</th><th>累计收入</th></tr>{rows}</table>"
+    else:
+        provider_table = '<table><tr><td class="empty">暂无收入</td></tr></table>'
+
+    # --- plans table with edit/toggle forms ---
+    if plans:
+        rows = []
+        for p in plans:
+            toggle_label = "停售" if p.is_active else "恢复"
+            rows.append(
+                f"<tr><td>{p.id}</td>"
+                f"<td><form class='inline' method='post' action='/admin/plans/update'>"
+                f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+                f"<input type='hidden' name='plan_id' value='{p.id}'>"
+                f"<input class='w130' name='name' value='{_esc(p.name)}'>"
+                f"<input class='w60' name='duration_days' type='number' min='1' value='{p.duration_days}'>"
+                f"<input type='hidden' name='chat_id' value='{p.chat_id}'>"
+                f"<span style='color:var(--muted);font-size:12px;display:inline-block;width:180px;vertical-align:middle;padding:0 6px' title='群组不可修改'>群组: {p.chat_id}</span>"
+                f"<input class='w60' name='price_stars' type='number' value='{p.price_stars}' title='Stars·XTR | 0=不启用'>"
+                f"<input class='w60' name='price_crypto' type='number' step='0.01' value='{p.price_crypto:g}' title='USDT | 0=不启用'>"
+                f"<input class='w60' name='price_stripe' type='number' value='{p.price_stripe}' title='Stripe·美分(999=US$9.99) | 0=不启用'>"
+                f"<input class='w80' name='price_alipay' type='number' step='0.01' value='{p.price_alipay:g}' title='支付宝·CNY | 0=不启用'>"
+                f"<input class='w80' name='price_wechat' type='number' step='0.01' value='{p.price_wechat:g}' title='微信·CNY | 0=不启用'>"
+                f"<button type='submit'>保存</button></form></td>"
+                f"<td><span class=\"tag {'active' if p.is_active else 'inactive'}\">"
+                f"{'在售' if p.is_active else '停用'}</span></td>"
+                f"<td><form class='inline' method='post' action='/admin/plans/toggle'>"
+                f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+                f"<input type='hidden' name='plan_id' value='{p.id}'>"
+                f"<button type='submit' class='danger'>{toggle_label}</button></form></td></tr>"
+            )
+        plans_table = (
+            "<table><tr><th>ID</th><th>名称 / 天数 / 群ID / XTR / USDT / 美分 / 支付宝CNY / 微信CNY</th>"
+            "<th>状态</th><th>操作</th></tr>" + "".join(rows) + "</table>"
+        )
+    else:
+        plans_table = '<table><tr><td class="empty">暂无套餐,用上方表单创建</td></tr></table>'
+
+    # --- subscriptions table with manage actions ---
+    if subs:
+        now = utcnow()
+        rows = []
+        for s in subs:
+            rows.append(
+                f"<tr><td>{s.user_id}</td>"
+                f"<td>{_esc(plan_names.get(s.plan_id, s.plan_id))}</td>"
+                f"<td>{s.expires_at.strftime('%Y-%m-%d %H:%M')}</td>"
+                f"<td>{max((s.expires_at - now).days, 0)} 天</td>"
+                f"<td><form class='inline' method='post' action='/admin/subs/adjust'>"
+                f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+                f"<input type='hidden' name='sub_id' value='{s.id}'>"
+                f"<input class='w90' name='delta' placeholder='+7 / -3' required>"
+                f"<button type='submit'>调整</button></form> "
+                f"<form class='inline' method='post' action='/admin/subs/revoke' "
+                f"onsubmit=\"return confirm('确认移除该会员并踢出群?')\">"
+                f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+                f"<input type='hidden' name='sub_id' value='{s.id}'>"
+                f"<button type='submit' class='danger'>移除</button></form></td></tr>"
+            )
+        subs_table = (
+            "<table><tr><th>用户 ID</th><th>套餐</th><th>到期 (UTC)</th>"
+            "<th>剩余</th><th>操作</th></tr>" + "".join(rows) + "</table>"
+        )
+    else:
+        hint = f"未找到用户 {_esc(q)} 的活跃订阅" if q else "暂无活跃订阅"
+        subs_table = f'<table><tr><td class="empty">{hint}</td></tr></table>'
+
+    if recent_orders:
+        rows = "".join(
+            f"<tr><td>{_esc(o.id[:8])}</td><td>{o.user_id}</td>"
+            f"<td>{_esc(plan_names.get(o.plan_id, o.plan_id))}</td>"
+            f"<td>{_esc(PROVIDER_LABELS.get(o.provider.value, o.provider.value))}</td>"
+            f"<td>{o.amount:g} {_esc(o.currency)}</td>"
+            f"<td><span class=\"tag {_esc(o.status.value)}\">{_esc(o.status.value)}</span>"
+            + ('<span class="tag pending" title="超时关闭后又收到支付,已自动补发">迟付复活</span>' if getattr(o, "revived", False) else "")
+            + f"</td>"
+            f"<td>{o.created_at.strftime('%m-%d %H:%M') if o.created_at else '-'}</td></tr>"
+            for o in recent_orders
+        )
+        orders_table = (
+            "<table><tr><th>订单</th><th>用户</th><th>套餐</th><th>渠道</th>"
+            "<th>金额</th><th>状态</th><th>时间</th></tr>" + rows + "</table>"
+        )
+    else:
+        orders_table = '<table><tr><td class="empty">暂无订单</td></tr></table>'
+
+    page = PAGE_TEMPLATE.format(
+        generated_at=utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        sidebar=_nav_html("dashboard", username),
+        flash=flash,
+        csrf_token=_esc(csrf_token),
+        q=_esc(q),
+        total_users=total_users,
+        active_subs=active_subs_count,
+        fulfilled_orders=fulfilled_count,
+        orders_7d=orders_7d,
+        revenue_cards=revenue_cards,
+        provider_table=provider_table,
+        plans_table=plans_table,
+        subs_table=subs_table,
+        orders_table=orders_table,
+    )
+
+    return HTMLResponse(content=page)
+
+
+# ---------------------------------------------------------------- plan actions
+
+
+@admin_panel_router.post("/admin/plans/create")
+async def plan_create(
+    request: Request,
+    csrf_token: str = Form(""),
+    name: str = Form(...),
+    duration_days: int = Form(...),
+    chat_id: int = Form(...),
+    price_stars: int = Form(0),
+    price_crypto: float = Form(0),
+    price_stripe: int = Form(0),
+    price_alipay: float = Form(0),
+    price_wechat: float = Form(0),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+
+    name = name.strip()[:255]
+    if duration_days < 1:
+        return _redirect("天数至少为 1", err=True)
+
+    # Validate the bot can actually access this chat
+    try:
+        from app.bot.dispatcher import bot
+
+        await bot.get_chat(chat_id)
+    except Exception:
+        return _redirect(f"机器人未加入群组 {chat_id}，请先将机器人添加为该群管理员", err=True)
+
+    async with async_session_factory() as session:
+        plan = Plan(
+            name=name,
+            duration_days=duration_days,
+            chat_id=chat_id,
+            price_stars=price_stars,
+            price_crypto=price_crypto,
+            price_stripe=price_stripe,
+            price_alipay=price_alipay,
+            price_wechat=price_wechat,
+        )
+        session.add(plan)
+        await session.commit()
+
+    return _redirect(f"套餐「{name}」已创建")
+
+
+@admin_panel_router.post("/admin/plans/update")
+async def plan_update(
+    request: Request,
+    csrf_token: str = Form(""),
+    plan_id: int = Form(...),
+    name: str = Form(...),
+    duration_days: int = Form(...),
+    chat_id: int = Form(...),
+    price_stars: int = Form(0),
+    price_crypto: float = Form(0),
+    price_stripe: int = Form(0),
+    price_alipay: float = Form(0),
+    price_wechat: float = Form(0),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+
+    name = name.strip()[:255]
+    if duration_days < 1:
+        return _redirect("天数至少为 1", err=True)
+
+    async with async_session_factory() as session:
+        plan = await session.get(Plan, plan_id)
+        if not plan:
+            return _redirect("套餐不存在", err=True)
+
+        # Reject chat_id changes — existing subscriptions are tied to the
+        # original chat_id and cannot be migrated automatically.  Create a
+        # new plan instead.
+        if str(chat_id) != str(plan.chat_id):
+            return _redirect(
+                f"不允许修改群组 ID（已有订阅绑定到群组 {plan.chat_id}）。"
+                f"如需更换群组，请新建套餐。",
+                err=True,
+            )
+
+        plan.name = name
+        plan.duration_days = duration_days
+        plan.price_stars = price_stars
+        plan.price_crypto = price_crypto
+        plan.price_stripe = price_stripe
+        plan.price_alipay = price_alipay
+        plan.price_wechat = price_wechat
+        await session.commit()
+
+    return _redirect(f"套餐 #{plan_id} 已保存")
+
+
+@admin_panel_router.post("/admin/plans/toggle")
+async def plan_toggle(
+    request: Request,
+    csrf_token: str = Form(""),
+    plan_id: int = Form(...),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+
+    async with async_session_factory() as session:
+        plan = await session.get(Plan, plan_id)
+        if not plan:
+            return _redirect("套餐不存在", err=True)
+        plan.is_active = not plan.is_active
+        state = "恢复在售" if plan.is_active else "已停售"
+        await session.commit()
+
+    return _redirect(f"套餐 #{plan_id} {state}")
+
+
+# ---------------------------------------------------------------- sub actions
+
+
+@admin_panel_router.post("/admin/subs/adjust")
+async def sub_adjust(
+    request: Request,
+    csrf_token: str = Form(""),
+    sub_id: int = Form(...),
+    delta: str = Form(...),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+
+    delta = delta.strip()
+    async with async_session_factory() as session:
+        sub = await session.get(Subscription, sub_id)
+        if not sub:
+            return _redirect("订阅不存在", err=True)
+        try:
+            sub.expires_at = apply_expiry_delta(sub.expires_at, delta)
+        except ValueError:
+            return _redirect("无效的调整值,用 +7 / -3 / YYYY-MM-DD", err=True)
+        sub.last_reminded_at = None  # changed expiry — re-enable reminders
+        new_expiry = sub.expires_at
+        user_id = sub.user_id
+        await session.commit()
+
+    try:
+        from app.bot.dispatcher import bot
+
+        await bot.send_message(
+            user_id,
+            f"Your subscription expiry has been updated to "
+            f"<b>{new_expiry.strftime('%Y-%m-%d %H:%M UTC')}</b>.",
+        )
+    except Exception:
+        pass
+
+    return _redirect(f"用户 {user_id} 到期时间已调整为 {new_expiry.strftime('%Y-%m-%d %H:%M')}")
+
+
+@admin_panel_router.post("/admin/subs/revoke")
+async def sub_revoke(
+    request: Request,
+    csrf_token: str = Form(""),
+    sub_id: int = Form(...),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+
+    async with async_session_factory() as session:
+        sub = await session.get(Subscription, sub_id)
+        if not sub:
+            return _redirect("订阅不存在", err=True)
+        sub.status = SubscriptionStatus.kicked
+        user_id, chat_id = sub.user_id, sub.group_chat_id
+        await session.commit()
+
+    try:
+        from app.bot.dispatcher import bot
+
+        await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        await bot.unban_chat_member(chat_id=chat_id, user_id=user_id)
+    except Exception as e:
+        logger.error("Panel revoke: failed to kick user %d: %s", user_id, e)
+        return _redirect(f"订阅已标记移除,但踢人失败(检查机器人权限): {e}", err=True)
+
+    return _redirect(f"用户 {user_id} 已移除并踢出群")
+
+
+# ---------------------------------------------------------------- settings page
+
+SETTINGS_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>支付设置 — 管理后台</title>
+""" + _STYLES + """
+</head>
+<body class="layout-body">
+<div class="layout">
+{sidebar}
+<main class="main-content">
+<div class="page-hdr">
+  <h1>支付设置</h1>
+  <div class="sub">修改后即时生效，无需重启</div>
+</div>
+{flash}
+
+<form method="post" action="/admin/settings/save">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+
+{groups}
+
+<div class="formrow" style="justify-content:center; margin-top:20px;">
+  <button type="submit" style="padding:10px 40px; font-size:14px;">保存所有设置</button>
+</div>
+</form>
+
+</main>
+</div>
+</body>
+</html>"""
+
+
+def _render_settings_form(config: dict, csrf_token: str) -> str:
+    """Build grouped form HTML from the current config."""
+    from app.payment_config import FIELD_META, GROUPS
+
+    groups_html: list[str] = []
+    for group_name in GROUPS:
+        fields: list[str] = []
+        for key, (group, label, placeholder, ftype) in FIELD_META.items():
+            if group != group_name:
+                continue
+            val = config.get(key, "")
+
+            if ftype == "bool":
+                checked = "checked" if str(val).lower() in ("true", "on", "1", "yes") else ""
+                fields.append(
+                    f'<tr><td style="width:140px">{_esc(label)}</td>'
+                    f'<td><label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">'
+                    f'<input type="checkbox" name="{_esc(key)}" value="on" {checked}> 启用'
+                    f'</label></td></tr>'
+                )
+            elif ftype == "select_epay_hupijiao":
+                opts = [("", "禁用"), ("epay", "易支付 (Epay)"), ("hupijiao", "虎皮椒 (HuPiJiao)")]
+                selected = str(val)
+                sel_html = "".join(
+                    f'<option value="{_esc(v)}" {"selected" if v == selected else ""}>{_esc(label)}</option>'
+                    for v, label in opts
+                )
+                fields.append(
+                    f'<tr><td style="width:140px">{_esc(label)}</td>'
+                    f'<td><select name="{_esc(key)}" style="width:180px">{sel_html}</select></td></tr>'
+                )
+            elif ftype == "password":
+                fields.append(
+                    f'<tr><td style="width:140px">{_esc(label)}</td>'
+                    f'<td><input type="password" name="{_esc(key)}" value="{_esc(val)}" '
+                    f'placeholder="{_esc(placeholder)}" style="width:360px"></td></tr>'
+                )
+            else:
+                fields.append(
+                    f'<tr><td style="width:140px">{_esc(label)}</td>'
+                    f'<td><input type="text" name="{_esc(key)}" value="{_esc(val)}" '
+                    f'placeholder="{_esc(placeholder)}" style="width:360px"></td></tr>'
+                )
+
+        if fields:
+            rows = "".join(fields)
+            groups_html.append(
+                f'<h2>{_esc(group_name)}</h2>'
+                f'<table><tbody>{rows}</tbody></table>'
+            )
+
+    return "".join(groups_html)
+
+
+@admin_panel_router.get("/admin/settings", response_class=HTMLResponse)
+async def settings_page(request: Request, msg: str = "", msg_type: str = "ok"):
+    username = _get_session(request)
+    if not username or not _password_changed():
+        return RedirectResponse(url="/admin/login", status_code=303)
+
+    from app.payment_config import get_config
+
+    flash = ""
+    if msg:
+        cls = "flash err" if msg_type == "err" else "flash"
+        flash = f'<div class="{cls}">{_esc(msg)}</div>'
+
+    csrf_token = request.cookies.get(SESSION_COOKIE, "")
+    page = SETTINGS_PAGE.format(
+        sidebar=_nav_html("settings", username),
+        flash=flash,
+        csrf_token=_esc(csrf_token),
+        groups=_render_settings_form(get_config(), csrf_token),
+    )
+    return HTMLResponse(content=page)
+
+
+@admin_panel_router.post("/admin/settings/save", response_class=HTMLResponse)
+async def settings_save(request: Request):
+    username = _get_session(request)
+    if not username or not _password_changed():
+        return RedirectResponse(url="/admin/login", status_code=303)
+
+    form = await request.form()
+    csrf_token = form.get("csrf_token", "")
+    if not _csrf_check(request, csrf_token):
+        return Response(status_code=401)
+
+    from app.payment_config import save_config
+
+    data = {k: v for k, v in form.items() if k != "csrf_token"}
+    save_config(data)
+
+    flash = '<div class="flash">支付设置已保存，即时生效</div>'
+    csrf = request.cookies.get(SESSION_COOKIE, "")
+    from app.payment_config import get_config
+
+    return HTMLResponse(
+        content=SETTINGS_PAGE.format(
+            sidebar=_nav_html("settings", username),
+            flash=flash,
+            csrf_token=_esc(csrf),
+            groups=_render_settings_form(get_config(), csrf),
+        )
+    )
+
+
+# ---------------------------------------------------------------- bot config page
+
+BOT_CONFIG_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>机器人配置 — 管理后台</title>
+""" + _STYLES + """
+</head>
+<body class="layout-body">
+<div class="layout">
+{sidebar}
+<main class="main-content">
+<div class="page-hdr">
+  <h1>⚙️ 机器人配置</h1>
+  <div class="sub">修改后即时生效，无需重启</div>
+</div>
+{flash}
+
+<form method="post" action="/admin/bot-config/save">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+
+<div class="sc">
+  <h2>🤖 基础配置</h2>
+
+  <div class="frow">
+    <label>Bot Token <span class="req">*</span></label>
+    <input type="text" name="bot_token" value="{bot_token}"
+      placeholder="从 @BotFather 获取的机器人Token">
+    <div class="fhint" style="color:var(--orange)">⚠️ 修改 Bot Token 后需<strong>重启服务</strong>才会生效（其余配置即时生效）</div>
+  </div>
+
+  <div class="frow">
+    <label>USDT 汇率 <span class="req">*</span></label>
+    <input type="number" name="usdt_rate" value="{usdt_rate}"
+      step="0.01" min="0" style="max-width:180px">
+    <div class="fhint">1 USDT = ? 人民币</div>
+  </div>
+
+  <div class="frow">
+    <label>管理员 TG 用户名</label>
+    <input type="text" name="admin_usernames" value="{admin_usernames}"
+      placeholder="username1,username2（不含 @，逗号分隔）">
+    <div class="fhint">管理员可以在机器人中执行特殊操作</div>
+  </div>
+
+  <div class="frow">
+    <label>机器人欢迎语</label>
+    <textarea name="welcome_message" rows="4">{welcome_message}</textarea>
+    <div class="fhint">用户首次使用 /start 命令时显示的欢迎语</div>
+  </div>
+
+  <div class="frow">
+    <label>订单超时时间（分钟）<span class="req">*</span></label>
+    <input type="number" name="order_timeout_minutes" value="{order_timeout_minutes}"
+      min="1" max="1440" style="max-width:180px">
+    <div class="fhint">订单多久未支付将自动过期</div>
+  </div>
+</div>
+
+<div class="sc">
+  <h2>⏰ 到期提醒设置</h2>
+
+  <div class="frow">
+    <label>到期前几天提醒</label>
+    <input type="number" name="expiry_reminder_days" value="{expiry_reminder_days}"
+      min="0" max="30" style="max-width:180px">
+    <div class="fhint">会员到期前几天发送提醒消息（每天 0 点检查一次），设为 0 禁用</div>
+  </div>
+
+  <div class="frow">
+    <label>到期提醒消息</label>
+    <textarea name="expiry_reminder_message" rows="3">{expiry_reminder_message}</textarea>
+    <div class="fhint">可用变量：{{days}}（剩余天数）、{{expiry_date}}（到期日期）</div>
+  </div>
+</div>
+
+<div style="margin-top:8px; padding-bottom:32px;">
+  <button class="btn-save" type="submit">保存配置</button>
+</div>
+</form>
+
+</main>
+</div>
+</body>
+</html>"""
+
+
+def _render_bot_config_page(cfg: dict, username: str, csrf_token: str, flash: str = "") -> str:
+    return BOT_CONFIG_PAGE.format(
+        sidebar=_nav_html("bot-config", username),
+        flash=flash,
+        csrf_token=_esc(csrf_token),
+        bot_token=_esc(cfg.get("bot_token", "")),
+        usdt_rate=_esc(cfg.get("usdt_rate", "7.20")),
+        admin_usernames=_esc(cfg.get("admin_usernames", "")),
+        welcome_message=_esc(cfg.get("welcome_message", "")),
+        order_timeout_minutes=_esc(cfg.get("order_timeout_minutes", "30")),
+        expiry_reminder_days=_esc(cfg.get("expiry_reminder_days", "3")),
+        expiry_reminder_message=_esc(cfg.get("expiry_reminder_message", "")),
+    )
+
+
+@admin_panel_router.get("/admin/bot-config", response_class=HTMLResponse)
+async def bot_config_page(request: Request, msg: str = "", msg_type: str = "ok"):
+    username = _get_session(request)
+    if not username or not _password_changed():
+        return RedirectResponse(url="/admin/login", status_code=303)
+
+    from app.bot_config import get_bot_config
+
+    flash = ""
+    if msg:
+        cls = "flash err" if msg_type == "err" else "flash"
+        flash = f'<div class="{cls}">{_esc(msg)}</div>'
+
+    csrf_token = request.cookies.get(SESSION_COOKIE, "")
+    return HTMLResponse(content=_render_bot_config_page(get_bot_config(), username, csrf_token, flash))
+
+
+@admin_panel_router.post("/admin/bot-config/save", response_class=HTMLResponse)
+async def bot_config_save(request: Request):
+    username = _get_session(request)
+    if not username or not _password_changed():
+        return RedirectResponse(url="/admin/login", status_code=303)
+
+    form = await request.form()
+    csrf_token = form.get("csrf_token", "")
+    if not _csrf_check(request, csrf_token):
+        return Response(status_code=401)
+
+    from app.bot_config import get_bot_config, save_bot_config
+
+    data = {k: v for k, v in form.items() if k != "csrf_token"}
+    save_bot_config(data)
+
+    flash = '<div class="flash">机器人配置已保存，即时生效</div>'
+    csrf = request.cookies.get(SESSION_COOKIE, "")
+    return HTMLResponse(content=_render_bot_config_page(get_bot_config(), username, csrf, flash))
