@@ -71,6 +71,17 @@ GROUPS = [
     "虎皮椒 (HuPiJiao)",
 ]
 
+ROUTING_GROUPS = frozenset({"支付宝路由", "微信支付路由"})
+# Shared backend sections — shown when any routing selector picks that backend.
+BACKEND_SECTION_IDS = {
+    "易支付 (Epay)": "backend-section-epay",
+    "虎皮椒 (HuPiJiao)": "backend-section-hupijiao",
+}
+BACKEND_BY_ROUTING_VALUE = {
+    "epay": "backend-section-epay",
+    "hupijiao": "backend-section-hupijiao",
+}
+
 _config_cache: dict = {}
 
 

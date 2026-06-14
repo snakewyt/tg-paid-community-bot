@@ -348,6 +348,8 @@ _STYLES = """<style>
     cursor: pointer; font-weight: 500;
   }}
   .btn-save:hover {{ background: #3d8de8; }}
+  .backend-section.hidden {{ display: none; }}
+  .backend-hint {{ color: var(--muted); font-size: 12px; margin: 4px 0 18px; line-height: 1.5; }}
 </style>"""
 
 # ----------------------------------------------------------------- login page
@@ -1107,60 +1109,105 @@ SETTINGS_PAGE = """<!DOCTYPE html>
 
 </main>
 </div>
+<script>
+(function () {{
+  function updateBackendSections() {{
+    var alipay = document.querySelector('[name="alipay_backend"]');
+    var wechat = document.querySelector('[name="wechat_backend"]');
+    var av = alipay ? alipay.value : '';
+    var wv = wechat ? wechat.value : '';
+    var epay = document.getElementById('backend-section-epay');
+    var hpj = document.getElementById('backend-section-hupijiao');
+    if (epay) epay.classList.toggle('hidden', av !== 'epay' && wv !== 'epay');
+    if (hpj) hpj.classList.toggle('hidden', av !== 'hupijiao' && wv !== 'hupijiao');
+  }}
+  document.querySelectorAll('[name="alipay_backend"], [name="wechat_backend"]').forEach(function (el) {{
+    el.addEventListener('change', updateBackendSections);
+  }});
+  updateBackendSections();
+}})();
+</script>
 </body>
 </html>"""
 
 
 def _render_settings_form(config: dict, csrf_token: str) -> str:
-    """Build grouped form HTML from the current config."""
-    from app.payment_config import FIELD_META, GROUPS
+    """Build grouped form HTML from the current config.
+
+    Routing groups only contain the backend selector. Epay / HuPiJiao config
+    lives in dedicated shared sections (one copy each). Client-side JS toggles
+    section visibility when routing dropdowns change.
+    """
+    from app.payment_config import BACKEND_SECTION_IDS, FIELD_META, GROUPS
+
+    def _render_field(key: str, ftype: str, label: str, val: str, placeholder: str) -> str:
+        if ftype == "bool":
+            checked = "checked" if str(val).lower() in ("true", "on", "1", "yes") else ""
+            return (
+                f'<tr><td style="width:140px">{_esc(label)}</td>'
+                f'<td><label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">'
+                f'<input type="checkbox" name="{_esc(key)}" value="on" {checked}> 启用'
+                f'</label></td></tr>'
+            )
+        if ftype == "select_epay_hupijiao":
+            opts = [("", "禁用"), ("epay", "易支付 (Epay)"), ("hupijiao", "虎皮椒 (HuPiJiao)")]
+            selected = str(val)
+            sel_html = "".join(
+                f'<option value="{_esc(v)}" {"selected" if v == selected else ""}>{_esc(lbl)}</option>'
+                for v, lbl in opts
+            )
+            return (
+                f'<tr><td style="width:140px">{_esc(label)}</td>'
+                f'<td><select name="{_esc(key)}" style="width:180px">{sel_html}</select></td></tr>'
+            )
+        if ftype == "password":
+            return (
+                f'<tr><td style="width:140px">{_esc(label)}</td>'
+                f'<td><input type="password" name="{_esc(key)}" value="{_esc(val)}" '
+                f'placeholder="{_esc(placeholder)}" style="width:360px"></td></tr>'
+            )
+        return (
+            f'<tr><td style="width:140px">{_esc(label)}</td>'
+            f'<td><input type="text" name="{_esc(key)}" value="{_esc(val)}" '
+            f'placeholder="{_esc(placeholder)}" style="width:360px"></td></tr>'
+        )
 
     groups_html: list[str] = []
+
     for group_name in GROUPS:
         fields: list[str] = []
         for key, (group, label, placeholder, ftype) in FIELD_META.items():
             if group != group_name:
                 continue
             val = config.get(key, "")
+            fields.append(_render_field(key, ftype, label, val, placeholder))
 
-            if ftype == "bool":
-                checked = "checked" if str(val).lower() in ("true", "on", "1", "yes") else ""
-                fields.append(
-                    f'<tr><td style="width:140px">{_esc(label)}</td>'
-                    f'<td><label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">'
-                    f'<input type="checkbox" name="{_esc(key)}" value="on" {checked}> 启用'
-                    f'</label></td></tr>'
-                )
-            elif ftype == "select_epay_hupijiao":
-                opts = [("", "禁用"), ("epay", "易支付 (Epay)"), ("hupijiao", "虎皮椒 (HuPiJiao)")]
-                selected = str(val)
-                sel_html = "".join(
-                    f'<option value="{_esc(v)}" {"selected" if v == selected else ""}>{_esc(label)}</option>'
-                    for v, label in opts
-                )
-                fields.append(
-                    f'<tr><td style="width:140px">{_esc(label)}</td>'
-                    f'<td><select name="{_esc(key)}" style="width:180px">{sel_html}</select></td></tr>'
-                )
-            elif ftype == "password":
-                fields.append(
-                    f'<tr><td style="width:140px">{_esc(label)}</td>'
-                    f'<td><input type="password" name="{_esc(key)}" value="{_esc(val)}" '
-                    f'placeholder="{_esc(placeholder)}" style="width:360px"></td></tr>'
-                )
-            else:
-                fields.append(
-                    f'<tr><td style="width:140px">{_esc(label)}</td>'
-                    f'<td><input type="text" name="{_esc(key)}" value="{_esc(val)}" '
-                    f'placeholder="{_esc(placeholder)}" style="width:360px"></td></tr>'
-                )
+        if not fields:
+            continue
 
-        if fields:
-            rows = "".join(fields)
+        rows = "".join(fields)
+        section_id = BACKEND_SECTION_IDS.get(group_name, "")
+        if section_id:
+            # Shared backend config — single section, toggled by JS
+            groups_html.append(
+                f'<div id="{section_id}" class="backend-section">'
+                f'<h2>{_esc(group_name)}</h2>'
+                f'<p class="backend-hint">全局共用：支付宝/微信路由指向此后台时共用以下配置，只需填写一次。</p>'
+                f'<table><tbody>{rows}</tbody></table>'
+                f'</div>'
+            )
+        else:
             groups_html.append(
                 f'<h2>{_esc(group_name)}</h2>'
                 f'<table><tbody>{rows}</tbody></table>'
             )
+            if group_name == "微信支付路由":
+                    groups_html.append(
+                        '<p class="backend-hint">'
+                        '选择「易支付」或「虎皮椒」后，下方会自动显示对应配置区域。'
+                        '支付宝与微信可分别选择不同后台，也可共用同一后台（只填一份配置）。'
+                        '</p>'
+                    )
 
     return "".join(groups_html)
 

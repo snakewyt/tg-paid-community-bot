@@ -1,166 +1,117 @@
-# Telegram Paid Community Bot
+# Telegram 付费社群机器人
 
-A Telegram bot framework similar to InviteMember for managing paid community groups.
+一套完整的 Telegram 付费社群管理系统。用户通过 Telegram 机器人自助选购套餐、完成支付，系统自动管理会员入群、到期踢出、续费提醒等全流程。
 
-## Features
+## 功能特性
 
-- Subscription plan management with multi-currency pricing
-- Four payment methods: Telegram Stars, CryptoBot (USDT), Stripe, Alipay/WeChat
-- Join-request invite links: anyone clicking the link files a join request, and the bot approves only the user with an active subscription — leaked/forwarded links are useless
-- Automatic expiry handling (kick + unban on expiry)
-- Renewal reminders (3 days, 1 day before expiry)
-- Admin commands for plan management, stats, grants, broadcast
-- Docker deployment
+- **套餐管理**：支持多种套餐，独立定价，可随时上架/下架
+- **五种支付方式**：Telegram Stars（零配置）、CryptoBot（USDT/TON）、Stripe（信用卡）、支付宝、微信支付
+- **支付后台路由**：支付宝和微信支付可选择虎皮椒或易支付作为后台，前端动态切换配置
+- **入群保护**：生成一次性入群链接，用户点击发起入群申请，机器人仅批准活跃会员——链接外泄无效
+- **自动到期处理**：到期自动踢出群并解除封禁，允许再次付费加入
+- **续费提醒**：可配置提前 N 天提醒，每会员每周期仅提醒一次，续费后重置
+- **支付容错**：原子操作防并发重复履约，超时订单自动清理，迟到付款自动"复活"
+- **管理后台**：Web 面板查看数据、管理套餐和会员、配置支付和机器人参数
+- **管理员命令**：Telegram 内直接操作（创建套餐、赠送会员、调整到期日、群发消息等）
+- **Docker 一键部署**：附带 Nginx + HTTPS 配置教程
 
-## Quick Start
+## 快速开始
 
-### 1. Create a Telegram Bot
+### 1. 创建 Telegram 机器人
 
-Talk to [@BotFather](https://t.me/BotFather), create a bot, and get the token.
+与 [@BotFather](https://t.me/BotFather) 对话，发送 `/newbot`，按提示创建机器人，获取 token。
 
-### 2. Clone & Configure
+### 2. 获取群/频道 chat_id
+
+创建你的付费群或频道，把机器人拉进去设为管理员（至少勾选"邀请用户"和"禁言/移除成员"权限）。用 [@getidsbot](https://t.me/getidsbot) 获取 chat_id。
+
+### 3. 克隆并配置
 
 ```bash
 cp .env.example .env
-# Edit .env with your bot token and admin IDs
+# 编辑 .env，填入你的 bot token 和管理员用户 ID
 ```
 
-Minimal `.env`:
+最小配置：
+
 ```env
 BOT_TOKEN=123456:ABC-DEF1234gh
 ADMIN_IDS=123456789
 ```
 
-### 3. Run
+### 4. 启动
 
 ```bash
-# With Docker
+# Docker 部署
 docker compose up -d
 
-# Or locally
+# 或本地运行
 pip install -r requirements.txt
 python -m app.main
 ```
 
-## Payment Setup
+### 5. 创建套餐
 
-### Telegram Stars
-Set `STARS_ENABLED=true` in `.env`. No additional keys needed — uses Telegram's native payments.
-
-### CryptoBot (USDT/TON)
-1. Open [@CryptoBot](https://t.me/CryptoBot) or [@CryptoTestnetBot](https://t.me/CryptoTestnetBot) for testing
-2. Run `/start` → `Crypto Pay` → `Create App` to get API token
-3. Set in `.env`:
-```env
-CRYPTO_ENABLED=true
-CRYPTO_API_TOKEN=your_api_token
-CRYPTO_WEBHOOK_SECRET=any_random_string
-```
-
-### Stripe
-1. Get keys from [Stripe Dashboard](https://dashboard.stripe.com/apikeys)
-2. Set webhook endpoint to `https://your-server.com/webhook/stripe` (events: `checkout.session.completed`)
-3. Set in `.env`:
-```env
-STRIPE_ENABLED=true
-STRIPE_SECRET_KEY=sk_live_...
-STRIPE_WEBHOOK_SECRET=whsec_...
-STRIPE_SUCCESS_URL=https://t.me/your_bot
-STRIPE_CANCEL_URL=https://t.me/your_bot
-```
-
-### Epay (易支付)
-1. Register with an Epay-compatible aggregator (Vmq, PaysApi, merchant account, etc.)
-2. Set notify URL to `https://your-server.com/webhook/epay`
-3. Set in `.env`:
-```env
-EPAY_ENABLED=true
-EPAY_API_URL=https://your-epay-gateway.com/
-EPAY_PID=your_merchant_id
-EPAY_KEY=your_merchant_key
-EPAY_NOTIFY_URL=https://your-server.com/webhook/epay
-```
-
-### HuPiJiao V3 (虎皮椒)
-1. Register at [xunhupay.com](https://www.xunhupay.com)
-2. Create a payment channel: 支付渠道管理 → 我的支付渠道 → 申请
-3. Get `APPID` and `APPSECRET`
-4. Set notify URL to `https://your-server.com/webhook/hupijiao`
-5. Set in `.env`:
-```env
-HUPIJIAO_ENABLED=true
-HUPIJIAO_APPID=your_appid
-HUPIJIAO_APPSECRET=your_appsecret
-HUPIJIAO_NOTIFY_URL=https://your-server.com/webhook/hupijiao
-```
-
-Each payment method has an independent on/off switch and per-plan price.
-Setting a price to 0 hides that method for that plan.
-
-### Alipay / WeChat Pay routing
-
-A single admin setting controls which backend processes each user-facing channel:
-
-```env
-# Choose one backend per channel: "epay" or "hupijiao"
-ALIPAY_BACKEND=hupijiao     # 支付宝 → 虎皮椒
-WECHAT_BACKEND=epay          # 微信支付 → 易支付
-```
-
-This means:
-- At most one backend handles 支付宝; at most one handles 微信支付
-- Their Configure sections below (易支付, 虎皮椒) only matter when the corresponding `*_BACKEND` points to them
-- Users see "支付宝" and "微信支付" buttons — never "易支付" or "虎皮椒"
-
-## Admin Commands
-
-| Command | Description |
-|---------|------------|
-| `/admin` | Show all admin commands |
-| `/addplan name duration_days chat_id [stars] [crypto] [stripe_cents] [cny]` | Create a plan |
-| `/editplan <id> <field> <value>` | Edit plan (fields: name, days, chat_id, stars, crypto, stripe, cny) |
-| `/delplan <id>` | Deactivate a plan |
-| `/plans` | List all plans |
-| `/stats` | Revenue & member statistics |
-| `/grant <user_id> <plan_id> <days>` | Gift subscription |
-| `/setexpiry <user_id> <plan_id> <+N\|-N\|YYYY-MM-DD>` | Adjust a user's expiry date |
-| `/active` | List active subscriptions |
-| `/broadcast <text>` | Send message to all users |
-
-## Admin Web Panel (Management Backend)
-
-A full management backend served by the same process:
-
-- Dashboard: revenue by currency/provider, active subscribers, recent orders
-- Plan management: create / edit (name, duration, prices, chat) / enable-disable
-- Member management: search by user ID, adjust expiry (`+7` / `-3` / exact date), revoke & kick
-- All purchases still happen inside the bot — the panel is for administration only
-
-1. Set a long random token in `.env`:
-```env
-ADMIN_PANEL_TOKEN=some-long-random-string
-```
-2. Visit `http://your-server:8000/admin?token=<value>` (token is then remembered via cookie).
-
-Leave `ADMIN_PANEL_TOKEN` empty to disable the panel entirely (returns 404).
-
-## Architecture
+在 Telegram 里对机器人发：
 
 ```
-User → Bot (/start) → Select Plan → Select Payment
-  ├── Stars: Native invoice → Telegram handles payment → Bot gets callback
-  ├── CryptoBot: API creates invoice → User pays in CryptoBot → Webhook callback
-  ├── Stripe: Checkout Session → User pays on Stripe page → Webhook callback
-  └── CN Pay: Epay redirect → User pays on aggregator page → Webhook callback
+/addplan 月度会员 30 -1001234567890 150
+```
+
+参数依次为：名称、天数、群 chat_id、Stars 价格。
+
+详细配置教程见 [docs/CONFIG_GUIDE.md](docs/CONFIG_GUIDE.md)。
+
+## 支付方式
+
+| 支付方式 | 配置难度 | 说明 |
+|---------|---------|------|
+| Telegram Stars | 零配置 | Telegram 原生支付，用户用 Stars 购买 |
+| CryptoBot | 简单 | 支持 USDT / TON，需在 @CryptoBot 创建 App |
+| Stripe | 中等 | 信用卡支付，需 Stripe 商户账号 |
+| 支付宝 | 中等 | 可路由到虎皮椒或易支付后台 |
+| 微信支付 | 中等 | 可路由到虎皮椒或易支付后台 |
+
+每个支付方式有独立的启用开关和套餐定价。套餐中将某支付方式价格设为 0 即表示该方式不启用，用户端不显示。
+
+## 管理员命令
+
+| 命令 | 说明 |
+|------|------|
+| `/admin` | 显示所有管理命令 |
+| `/addplan 名称 天数 群ID [stars] [usdt] [美分] [cny]` | 创建套餐 |
+| `/editplan <id> <字段> <值>` | 修改套餐（chat_id 不可改） |
+| `/delplan <id>` | 停用套餐 |
+| `/plans` | 查看所有套餐 |
+| `/stats` | 收入统计 + 活跃会员数 |
+| `/grant <用户ID> <套餐ID> <天数>` | 赠送会员 |
+| `/setexpiry <用户ID> <套餐ID> <+N/-N/日期>` | 调整到期时间 |
+| `/active` | 所有活跃订阅列表 |
+| `/broadcast <消息>` | 群发所有人（自动限速 ~25条/秒） |
+
+## 管理后台
+
+启动后访问 `http://你的服务器:8000/admin/login`。
+
+- **默认账号**：`admin` / `123456`（首次登录强制修改密码）
+- **首页仪表盘**：收入统计、套餐管理、会员管理、订单流水
+- **机器人配置**：Token、汇率、欢迎语、超时时间、到期提醒等
+- **支付设置**：所有支付渠道配置，保存即时生效
+
+## 架构
+
+```
+用户 → Bot (/start) → 选择套餐 → 选择支付方式
+  ├── Stars: Telegram 原生发票 → 回调
+  ├── CryptoBot: API 创建发票 → Webhook 回调
+  ├── Stripe: Checkout Session → Webhook 回调
+  └── 支付宝/微信: 跳转支付页面 → Webhook 回调
                          ↓
-           Payment callback → Fulfill order → Create subscription
+           支付回调 → 验证签名 → 履约订单 → 创建/延长订阅
                          ↓
-           Bot sends one-time invite link → User joins group
+           Bot 发送一次性入群链接 → 用户入群
                          ↓
-           Scheduler: hourly expiry check → kick expired users
-                      every 6h → renewal reminders (3d, 1d before)
+           定时任务: 每小时检查到期 → 踢出过期用户
+                    每天检查即将到期 → 发送续费提醒
+                    每15分钟清理超时未付订单
 ```
-
-## License
-
-MIT
