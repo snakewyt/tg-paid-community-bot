@@ -1,5 +1,7 @@
 # Telegram 付费社群机器人
 
+**Language / 语言:** [简体中文](README.md) · [English](README_en.md)
+
 一套完整的 Telegram 付费社群管理系统。用户通过 Telegram 机器人自助选购套餐、完成支付，系统自动管理会员入群、到期踢出、续费提醒等全流程。
 
 ## 功能特性
@@ -99,4 +101,4 @@ docker compose exec bot alembic upgrade head
 定时任务：每小时踢到期 / 每6h续费提醒 / 每15min清理超时订单
 ```
 
-完整部署与域名、支付、安全说明 → [docs/CONFIG_GUIDE.md](docs/CONFIG_GUIDE.md)
+完整部署与域名、支付、安全说明 → [docs/CONFIG_GUIDE.md](docs/CONFIG_GUIDE.md)（中文）
