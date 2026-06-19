@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Annotated
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -12,7 +15,20 @@ class Settings(BaseSettings):
 
     # --- Bot ---
     bot_token: str = ""
-    admin_ids: list[int] = []
+    admin_ids: Annotated[list[int], NoDecode] = []
+
+    @field_validator("admin_ids", mode="before")
+    @classmethod
+    def _parse_admin_ids(cls, v: object) -> list[int]:
+        if v is None or v == "":
+            return []
+        if isinstance(v, int):
+            return [v]
+        if isinstance(v, str):
+            return [int(x.strip()) for x in v.split(",") if x.strip()]
+        if isinstance(v, list):
+            return [int(x) for x in v]
+        return v  # type: ignore[return-value]
 
     # --- Telegram Stars ---
     stars_enabled: bool = False

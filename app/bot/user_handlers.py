@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import urllib.parse
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -11,7 +13,7 @@ from app.bot.dispatcher import bot
 from app.config import settings
 from app.constants import PROVIDER_LABELS
 from app.database import async_session_factory
-from app.models.models import Order, Plan, User
+from app.models.models import Order, OrderStatus, Plan, User
 from app.payments.base import list_configured_providers, get_provider
 from app.services.membership import get_active_subscriptions
 from app.services.orders import cancel_user_pending_orders, create_order
@@ -57,7 +59,25 @@ def _provider_keyboard(plan_id: int) -> InlineKeyboardMarkup:
             callback_data=f"pay_select:{plan_id}:{p.name}",
         )
     builder.adjust(2)
+    builder.row(InlineKeyboardButton(text="❌ 取消", callback_data="checkout_cancel"))
     return builder.as_markup()
+
+
+def _payment_keyboard(
+    plan_id: int,
+    order_id: str,
+    *,
+    pay_url: str | None = None,
+    qr_url: str | None = None,
+    mobile_label: str = "Pay Now",
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if pay_url:
+        rows.append([InlineKeyboardButton(text=f"📱 {mobile_label}", url=pay_url)])
+    if qr_url:
+        rows.append([InlineKeyboardButton(text="🖥 网页二维码", url=qr_url)])
+    rows.append([InlineKeyboardButton(text="❌ 取消支付", callback_data=f"pay_cancel:{order_id}:{plan_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @user_router.message(Command("start"))
@@ -129,6 +149,96 @@ async def on_plan_select(callback: CallbackQuery):
         reply_markup=_provider_keyboard(plan.id),
     )
     await callback.answer()
+
+
+async def _show_plan_list(target: Message) -> None:
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+
+        plans = (await session.execute(select(Plan).where(Plan.is_active == True))).scalars().all()
+
+    if not plans:
+        await target.edit_text("No plans available yet. Contact admin.")
+        return
+
+    welcome = (settings.welcome_message or "").strip()
+    text = f"{welcome}\n\n请选择套餐：" if welcome else "请选择套餐："
+    await target.edit_text(text, reply_markup=_plan_keyboard(list(plans)))
+
+
+@user_router.callback_query(F.data == "checkout_cancel")
+async def on_checkout_cancel(callback: CallbackQuery):
+    await _show_plan_list(callback.message)
+    await callback.answer("已取消")
+
+
+@user_router.callback_query(F.data.startswith("pay_cancel:"))
+async def on_pay_cancel(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    order_id = parts[1]
+    plan_id = int(parts[2]) if len(parts) > 2 else None
+
+    async with async_session_factory() as session:
+        order = await session.get(Order, order_id)
+        if (
+            order
+            and order.user_id == callback.from_user.id
+            and order.status == OrderStatus.pending
+        ):
+            order.status = OrderStatus.cancelled
+        if plan_id is not None:
+            plan = await session.get(Plan, plan_id)
+        else:
+            plan = None
+        await session.commit()
+
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    if plan and plan.is_active:
+        providers = list_configured_providers()
+        price_display = []
+        for p in providers:
+            if p.name == "stars" and plan.price_stars:
+                price_display.append(f"Stars: {plan.price_stars} XTR")
+            elif p.name == "crypto" and plan.price_crypto:
+                price_display.append(f"Crypto: {plan.price_crypto} USDT")
+            elif p.name == "stripe" and plan.price_stripe:
+                price_display.append(f"Stripe: ${plan.price_stripe / 100:.2f}")
+            elif p.name == "alipay" and plan.price_alipay:
+                price_display.append(f"支付宝: ¥{plan.price_alipay:.2f}")
+            elif p.name == "wechat" and plan.price_wechat:
+                price_display.append(f"微信支付: ¥{plan.price_wechat:.2f}")
+
+        text = f"<b>{plan.name}</b>\n"
+        if plan.description:
+            text += f"{plan.description}\n\n"
+        text += "Prices:\n" + "\n".join(f"  • {p}" for p in price_display)
+        text += "\n\nSelect payment method:"
+        await bot.send_message(
+            callback.from_user.id,
+            text,
+            reply_markup=_provider_keyboard(plan.id),
+        )
+    else:
+        plans = []
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+
+            plans = (
+                await session.execute(select(Plan).where(Plan.is_active == True))
+            ).scalars().all()
+        welcome = (settings.welcome_message or "").strip()
+        text = f"{welcome}\n\n请选择套餐：" if welcome else "请选择套餐："
+        await bot.send_message(
+            callback.from_user.id,
+            text,
+            reply_markup=_plan_keyboard(list(plans)),
+        )
+
+    await callback.answer("已取消支付")
 
 
 @user_router.callback_query(F.data.startswith("pay_select:"))
@@ -206,14 +316,55 @@ async def on_pay_select(callback: CallbackQuery):
                 o.external_id = result.provider_tx_id
                 await session.commit()
 
+    if provider.name in ("alipay", "wechat") and result.pay_url:
+        label = "打开支付宝" if provider.name == "alipay" else "打开微信支付"
+        keyboard = _payment_keyboard(
+            plan_id,
+            order_id,
+            pay_url=result.pay_url,
+            qr_url=result.qr_url,
+            mobile_label=label,
+        )
+        caption = (
+            f"请支付 <b>{amount}</b> {currency} 购买 <b>{plan.name}</b>\n\n"
+            "📷 请用支付宝扫描下方二维码，或点击按钮在手机中付款。"
+            if provider.name == "alipay"
+            else f"请支付 <b>{amount}</b> {currency} 购买 <b>{plan.name}</b>\n\n"
+            "📷 请用微信扫描下方二维码，或点击按钮在手机中付款。"
+        )
+        qr_image = (
+            "https://api.qrserver.com/v1/create-qr-code/?size=400x400&data="
+            + urllib.parse.quote(result.pay_url, safe="")
+        )
+        await callback.message.delete()
+        sent = await bot.send_photo(
+            chat_id=callback.from_user.id,
+            photo=qr_image,
+            caption=caption,
+            reply_markup=keyboard,
+        )
+        async with async_session_factory() as session:
+            o = await session.get(Order, order_id)
+            if o:
+                o.payment_message_id = sent.message_id
+                await session.commit()
+        await callback.answer()
+        return
+
     await callback.message.edit_text(
         f"Pay {amount} {currency} to join <b>{plan.name}</b>:\n\n{result.pay_url}",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Pay Now", url=result.pay_url)],
-            ]
+        reply_markup=_payment_keyboard(
+            plan_id,
+            order_id,
+            pay_url=result.pay_url,
+            mobile_label="Pay Now",
         ),
     )
+    async with async_session_factory() as session:
+        o = await session.get(Order, order_id)
+        if o:
+            o.payment_message_id = callback.message.message_id
+            await session.commit()
     await callback.answer()
 
 

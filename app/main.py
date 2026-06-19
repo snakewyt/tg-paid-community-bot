@@ -33,19 +33,19 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+    from alembic.config import Config as AlembicConfig
+    from alembic import command
+
+    alembic_cfg = AlembicConfig("alembic.ini")
+    command.upgrade(alembic_cfg, "head")
+    logger.info("Database migrations applied")
+
     dp.include_router(user_router)
     dp.include_router(payment_router)
     dp.include_router(admin_router)
     dp.include_router(join_router)
 
     async def startup():
-        from alembic.config import Config as AlembicConfig
-        from alembic import command
-
-        alembic_cfg = AlembicConfig("alembic.ini")
-        command.upgrade(alembic_cfg, "head")
-        logger.info("Database migrations applied")
-
         init_payment_config()
 
         from app.bot_config import init_bot_config

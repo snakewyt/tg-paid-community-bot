@@ -15,6 +15,7 @@ class PaymentResult:
     success: bool
     provider_tx_id: str | None = None
     pay_url: str | None = None
+    qr_url: str | None = None  # HuPiJiao url_qrcode (PC scan page)
     invoice_payload: str | None = None  # for Stars sendInvoice
 
 

@@ -32,6 +32,15 @@ async def notify_fulfillment(order_id: str) -> str | None:
         chat_id = plan.chat_id
         user_id = order.user_id
         plan_name = plan.name
+        payment_message_id = order.payment_message_id
+
+    if payment_message_id:
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=payment_message_id)
+        except TelegramBadRequest:
+            pass
+        except Exception as e:
+            logger.warning("Failed to delete payment message for order %s: %s", order_id, e)
 
     try:
         # Join-request mode: clicking the link only files a request; the bot
