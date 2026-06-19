@@ -14,7 +14,6 @@ BOT_CONFIG_PATH = Path("data/bot_config.json")
 
 BOT_CONFIG_KEYS = {
     "bot_token",
-    "usdt_rate",
     "admin_usernames",
     "welcome_message",
     "order_timeout_minutes",
@@ -25,7 +24,6 @@ BOT_CONFIG_KEYS = {
 _SECRET_KEYS = frozenset({"bot_token"})
 
 _TYPE_MAP: dict = {
-    "usdt_rate": float,
     "order_timeout_minutes": int,
     "expiry_reminder_days": int,
 }

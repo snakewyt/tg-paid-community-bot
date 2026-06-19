@@ -79,8 +79,7 @@ class Settings(BaseSettings):
     admin_panel_allowed_ips: str = ""
 
     # --- Bot behavior (configurable via admin panel) ---
-    usdt_rate: float = 7.20
-    admin_usernames: str = ""  # comma-separated TG usernames for admin commands
+    admin_usernames: str = ""  # comma-separated TG usernames; grants admin with admin_ids
     welcome_message: str = "欢迎使用VIP会员购买机器人！\n\n请选择您需要的服务："
     order_timeout_minutes: int = 30
     expiry_reminder_days: int = 3

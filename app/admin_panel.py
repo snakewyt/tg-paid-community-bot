@@ -1387,17 +1387,10 @@ BOT_CONFIG_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="frow">
-    <label>USDT 汇率 <span class="req">*</span></label>
-    <input type="number" name="usdt_rate" value="{usdt_rate}"
-      step="0.01" min="0" style="max-width:180px">
-    <div class="fhint">1 USDT = ? 人民币</div>
-  </div>
-
-  <div class="frow">
     <label>管理员 TG 用户名</label>
     <input type="text" name="admin_usernames" value="{admin_usernames}"
       placeholder="username1,username2（不含 @，逗号分隔）">
-    <div class="fhint">管理员可以在机器人中执行特殊操作</div>
+    <div class="fhint">逗号分隔，不含 @。与 .env 中 ADMIN_IDS 二选一或同时填写，保存后即时生效</div>
   </div>
 
   <div class="frow">
@@ -1448,7 +1441,6 @@ def _render_bot_config_page(cfg: dict, username: str, csrf_token: str, flash: st
         flash=flash,
         csrf_token=_esc(csrf_token),
         bot_token="",
-        usdt_rate=_esc(cfg.get("usdt_rate", "7.20")),
         admin_usernames=_esc(cfg.get("admin_usernames", "")),
         welcome_message=_esc(cfg.get("welcome_message", "")),
         order_timeout_minutes=_esc(cfg.get("order_timeout_minutes", "30")),

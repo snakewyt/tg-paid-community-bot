@@ -123,14 +123,7 @@ async def on_plan_select(callback: CallbackQuery):
         if p.name == "stars" and plan.price_stars:
             price_display.append(f"Stars: {plan.price_stars} XTR")
         elif p.name == "crypto" and plan.price_crypto:
-            line = f"Crypto: {plan.price_crypto} USDT"
-            try:
-                rate = float(settings.usdt_rate)
-                if rate > 0:
-                    line += f" (≈¥{plan.price_crypto * rate:.2f})"
-            except (TypeError, ValueError):
-                pass
-            price_display.append(line)
+            price_display.append(f"Crypto: {plan.price_crypto} USDT")
         elif p.name == "stripe" and plan.price_stripe:
             price_display.append(f"Stripe: ${plan.price_stripe / 100:.2f}")
         elif p.name == "alipay" and plan.price_alipay:

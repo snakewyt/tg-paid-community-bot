@@ -24,17 +24,15 @@ from app.models.models import (
 from app.services.grant import grant_subscription
 from app.services.kick import kick_user_from_chat
 from app.services.notify import notify_fulfillment
-from app.utils import apply_expiry_delta, utcnow
+from app.utils import apply_expiry_delta, is_telegram_admin, utcnow
 
 admin_router = Router()
 logger = logging.getLogger(__name__)
 
 
 def _is_admin(user) -> bool:
-    """Admin if numeric Telegram user ID is in admin_ids."""
-    if user is None:
-        return False
-    return user.id in settings.admin_ids
+    """Admin if Telegram user ID or username matches configured admins."""
+    return is_telegram_admin(user, settings.admin_ids, settings.admin_usernames)
 
 
 @admin_router.message(Command("admin"))
