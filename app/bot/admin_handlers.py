@@ -24,6 +24,7 @@ from app.models.models import (
 from app.services.grant import grant_subscription
 from app.services.kick import kick_user_from_chat
 from app.services.notify import notify_fulfillment
+from app.services.user_resolve import format_user_ref, resolve_telegram_user_id
 from app.utils import apply_expiry_delta, is_telegram_admin, utcnow
 
 admin_router = Router()
@@ -46,8 +47,8 @@ async def cmd_admin(message: Message):
         "/editplan <id> <field> <value> — edit a plan\n"
         "/delplan <id> — delete a plan\n"
         "/stats — revenue & member stats\n"
-        "/grant <user_id> <plan_id> <days> — gift subscription\n"
-        "/setexpiry <user_id> <plan_id> <+N|-N|YYYY-MM-DD> — adjust expiry\n"
+        "/grant <用户ID或@用户名> <plan_id> <days> — gift subscription\n"
+        "/setexpiry <用户ID或@用户名> <plan_id> <+N|-N|YYYY-MM-DD> — adjust expiry\n"
         "/broadcast <text> — send message to all users\n"
         "/active — list active subscriptions"
     )
@@ -202,27 +203,32 @@ async def cmd_setexpiry(message: Message, command: CommandObject):
     if not _is_admin(message.from_user):
         return
 
-    # /setexpiry <user_id> <plan_id> <+N|-N|YYYY-MM-DD>
+    # /setexpiry <user> <plan_id> <+N|-N|YYYY-MM-DD>
     args = (command.args or "").split()
     if len(args) < 3:
         await message.answer(
-            "Usage: /setexpiry <user_id> <plan_id> <+N|-N|YYYY-MM-DD>\n"
+            "Usage: /setexpiry <用户ID或@用户名> <plan_id> <+N|-N|YYYY-MM-DD>\n"
             "Examples:\n"
             "  /setexpiry 123456789 1 +7    (extend 7 days)\n"
-            "  /setexpiry 123456789 1 -3    (reduce 3 days)\n"
-            "  /setexpiry 123456789 1 2026-12-31  (set exact date)"
+            "  /setexpiry @alice 1 -3       (reduce 3 days)\n"
+            "  /setexpiry @alice 1 2026-12-31  (set exact date)"
         )
         return
 
     try:
-        user_id = int(args[0])
         plan_id = int(args[1])
     except ValueError:
-        await message.answer("Invalid user_id or plan_id.")
+        await message.answer("Invalid plan_id.")
         return
 
     raw = args[2]
     async with async_session_factory() as session:
+        try:
+            user_id = await resolve_telegram_user_id(session, args[0])
+        except ValueError as e:
+            await message.answer(str(e))
+            return
+
         from sqlalchemy import select
 
         sub = (
@@ -366,37 +372,44 @@ async def cmd_stats(message: Message):
 async def cmd_grant(message: Message, command: CommandObject):
     if not _is_admin(message.from_user):
         return
-    # /grant <user_id> <plan_id> <days>
+    # /grant <user> <plan_id> <days>
     args = (command.args or "").split()
     if len(args) < 3:
-        await message.answer("Usage: /grant <user_id> <plan_id> <days>")
+        await message.answer("Usage: /grant <用户ID或@用户名> <plan_id> <days>")
         return
     try:
-        user_id = int(args[0])
         plan_id = int(args[1])
         days = int(args[2])
     except ValueError:
-        await message.answer("Invalid arguments.")
+        await message.answer("Invalid plan_id or days.")
         return
 
     async with async_session_factory() as session:
         try:
+            user_id = await resolve_telegram_user_id(session, args[0])
+        except ValueError as e:
+            await message.answer(str(e))
+            return
+        try:
             order = await grant_subscription(session, user_id, plan_id, days)
             plan = await session.get(Plan, plan_id)
+            user = await session.get(User, user_id)
             await session.commit()
         except ValueError as e:
             await message.answer(str(e))
             return
 
-    await message.answer(f"Granted {days} days of <b>{plan.name}</b> to user {user_id}.")
+    label = format_user_ref(user_id, user.username if user else None)
+
+    await message.answer(f"Granted {days} days of <b>{plan.name}</b> to {label}.")
 
     # Send invite link to the gifted user
     link = await notify_fulfillment(order.id)
     if link:
-        await message.answer(f"已自动发送邀请链接给用户 {user_id}。")
+        await message.answer(f"已自动发送邀请链接给用户 {label}。")
     else:
         await message.answer(
-            f"⚠️ 邀请链接创建失败，请手动将用户 {user_id} 拉入群组 {plan.chat_id}，"
+            f"⚠️ 邀请链接创建失败，请手动将用户 {label} 拉入群组 {plan.chat_id}，"
             f"或确认机器人是该群管理员。",
         )
 
@@ -430,11 +443,22 @@ async def cmd_active(message: Message):
         ).scalars().all()
     plan_map = {p.id: p for p in plans}
 
+    user_ids = {s.user_id for s in subs}
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+
+        users = (
+            await session.execute(select(User).where(User.id.in_(user_ids)))
+        ).scalars().all()
+    user_map = {u.id: u for u in users}
+
     lines = ["<b>Active subscriptions:</b>", ""]
     for s in subs[:100]:
         plan = plan_map.get(s.plan_id)
+        u = user_map.get(s.user_id)
+        label = format_user_ref(s.user_id, u.username if u else None)
         lines.append(
-            f"  • user={s.user_id} | {plan.name if plan else 'N/A'} "
+            f"  • {label} | {plan.name if plan else 'N/A'} "
             f"| expires {s.expires_at.strftime('%Y-%m-%d')}"
         )
     if len(subs) > 100:

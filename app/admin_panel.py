@@ -37,6 +37,11 @@ from app.models.models import (
     SubscriptionStatus,
     User,
 )
+from app.services.user_resolve import (
+    find_user_ids_for_search,
+    format_user_ref,
+    resolve_telegram_user_id,
+)
 from app.utils import apply_expiry_delta, utcnow
 
 logger = logging.getLogger(__name__)
@@ -482,8 +487,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <form method="post" action="/admin/subs/grant" style="margin:0">
 <input type="hidden" name="csrf_token" value="{csrf_token}">
 <div class="formrow">
-  <span>用户 ID:</span>
-  <input class="w130" name="user_id" type="number" placeholder="Telegram 用户 ID" required>
+  <span>用户:</span>
+  <input class="w130" name="user_id" type="text" placeholder="ID 或 @用户名" required>
   <span>套餐:</span>
   <select name="plan_id" style="width:180px">{grant_options}</select>
   <span>天数:</span>
@@ -496,7 +501,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <div class="formrow">
   <form class="inline" method="get" action="/admin">
     <span>搜索用户:</span>
-    <input class="w130" name="q" placeholder="Telegram 用户 ID" value="{q}">
+    <input class="w130" name="q" placeholder="ID 或 @用户名" value="{q}">
     <button type="submit">搜索</button>
   </form>
 </div>
@@ -791,15 +796,24 @@ async def admin_dashboard(request: Request):
             Subscription.expires_at > utcnow(),
         )
         if q:
-            try:
-                sub_stmt = sub_stmt.where(Subscription.user_id == int(q))
-            except ValueError:
-                pass
+            user_ids = await find_user_ids_for_search(session, q)
+            if user_ids:
+                sub_stmt = sub_stmt.where(Subscription.user_id.in_(user_ids))
+            else:
+                sub_stmt = sub_stmt.where(Subscription.user_id == -1)
         subs = (
             (await session.execute(sub_stmt.order_by(Subscription.expires_at).limit(50)))
             .scalars()
             .all()
         )
+
+        sub_user_ids = {s.user_id for s in subs}
+        sub_users = (
+            await session.execute(select(User).where(User.id.in_(sub_user_ids)))
+        ).scalars().all() if sub_user_ids else []
+        user_labels = {
+            u.id: format_user_ref(u.id, u.username) for u in sub_users
+        }
 
     plan_names = {p.id: p.name for p in plans}
     csrf_token = request.cookies.get(SESSION_COOKIE, "")
@@ -865,7 +879,7 @@ async def admin_dashboard(request: Request):
         rows = []
         for s in subs:
             rows.append(
-                f"<tr><td>{s.user_id}</td>"
+                f"<tr><td>{_esc(user_labels.get(s.user_id, str(s.user_id)))}</td>"
                 f"<td>{_esc(plan_names.get(s.plan_id, s.plan_id))}</td>"
                 f"<td>{s.expires_at.strftime('%Y-%m-%d %H:%M')}</td>"
                 f"<td>{max((s.expires_at - now).days, 0)} 天</td>"
@@ -1053,7 +1067,7 @@ async def plan_toggle(
 async def sub_grant(
     request: Request,
     csrf_token: str = Form(""),
-    user_id: int = Form(...),
+    user_id: str = Form(...),
     plan_id: int = Form(...),
     days: int = Form(...),
 ):
@@ -1062,10 +1076,15 @@ async def sub_grant(
 
     async with async_session_factory() as session:
         try:
+            resolved_id = await resolve_telegram_user_id(session, user_id)
+        except ValueError as e:
+            return _redirect(str(e), err=True)
+        try:
             from app.services.grant import grant_subscription
 
-            order = await grant_subscription(session, user_id, plan_id, days)
+            order = await grant_subscription(session, resolved_id, plan_id, days)
             plan = await session.get(Plan, plan_id)
+            user = await session.get(User, resolved_id)
             await session.commit()
         except ValueError as e:
             return _redirect(str(e), err=True)
@@ -1074,12 +1093,13 @@ async def sub_grant(
 
     link = await notify_fulfillment(order.id)
     plan_name = plan.name if plan else str(plan_id)
+    label = format_user_ref(resolved_id, user.username if user else None)
     if not link:
         return _redirect(
             f"会员已赠送,但邀请链接创建失败——请确保机器人是该群管理员",
             err=True,
         )
-    return _redirect(f"已赠送 {days} 天「{plan_name}」给用户 {user_id}，邀请链接已发送")
+    return _redirect(f"已赠送 {days} 天「{plan_name}」给用户 {label}，邀请链接已发送")
 
 
 # ---------------------------------------------------------------- sub actions
