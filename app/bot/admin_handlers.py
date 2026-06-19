@@ -404,9 +404,14 @@ async def cmd_grant(message: Message, command: CommandObject):
     await message.answer(f"Granted {days} days of <b>{plan.name}</b> to {label}.")
 
     # Send invite link to the gifted user
-    link = await notify_fulfillment(order.id)
-    if link:
+    result = await notify_fulfillment(order.id)
+    if result.link and result.dm_sent:
         await message.answer(f"已自动发送邀请链接给用户 {label}。")
+    elif result.link:
+        await message.answer(
+            f"⚠️ 无法私聊用户 {label}（可能未与机器人对话）。"
+            f"请手动转发入群链接：\n{result.link}"
+        )
     else:
         await message.answer(
             f"⚠️ 邀请链接创建失败，请手动将用户 {label} 拉入群组 {plan.chat_id}，"

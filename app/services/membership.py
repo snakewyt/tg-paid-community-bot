@@ -29,14 +29,20 @@ async def has_active_subscription(
     session: AsyncSession, user_id: int, chat_id: int
 ) -> bool:
     """Whether the user holds an unexpired subscription for this group/channel."""
+    sub = await get_active_subscription(session, user_id, chat_id)
+    return sub is not None
+
+
+async def get_active_subscription(
+    session: AsyncSession, user_id: int, chat_id: int
+) -> Subscription | None:
     stmt = select(Subscription).where(
         Subscription.user_id == user_id,
         Subscription.group_chat_id == chat_id,
         Subscription.status == SubscriptionStatus.active,
         Subscription.expires_at > utcnow(),
     )
-    result = await session.execute(stmt)
-    return result.scalars().first() is not None
+    return (await session.execute(stmt)).scalars().first()
 
 
 async def find_expired(session: AsyncSession) -> list[Subscription]:

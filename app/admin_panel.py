@@ -21,6 +21,7 @@ import secrets
 import time
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -205,7 +206,7 @@ def _csrf_check(request: Request, form_csrf: str) -> bool:
 
 def _redirect(msg: str, err: bool = False) -> RedirectResponse:
     flag = "err" if err else "ok"
-    return RedirectResponse(url=f"/admin?msg={msg}&t={flag}", status_code=303)
+    return RedirectResponse(url=f"/admin?msg={quote(msg)}&t={flag}", status_code=303)
 
 
 # ---------------------------------------------------------------------- styles
@@ -1091,15 +1092,20 @@ async def sub_grant(
 
     from app.services.notify import notify_fulfillment
 
-    link = await notify_fulfillment(order.id)
+    result = await notify_fulfillment(order.id)
     plan_name = plan.name if plan else str(plan_id)
     label = format_user_ref(resolved_id, user.username if user else None)
-    if not link:
+    if not result.link:
         return _redirect(
-            f"会员已赠送,但邀请链接创建失败——请确保机器人是该群管理员",
+            "会员已赠送,但邀请链接创建失败——请确保机器人是该群管理员",
             err=True,
         )
-    return _redirect(f"已赠送 {days} 天「{plan_name}」给用户 {label}，邀请链接已发送")
+    if result.dm_sent:
+        return _redirect(f"已赠送 {days} 天「{plan_name}」给用户 {label}，邀请链接已发送至 Telegram")
+    return _redirect(
+        f"已赠送 {days} 天「{plan_name}」给用户 {label}。"
+        f"对方未与机器人对话，无法私聊发送。请手动转发入群链接：{result.link}"
+    )
 
 
 # ---------------------------------------------------------------- sub actions
