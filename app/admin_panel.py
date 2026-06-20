@@ -415,32 +415,32 @@ _STYLES = """<style>
 </style>"""
 
 _THEME_BOOTSTRAP = """<script>
-(function () {
+(function () {{
   var k = 'admin_theme', s = localStorage.getItem(k);
   var t = s || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
   document.documentElement.setAttribute('data-theme', t);
-})();
+}})();
 </script>"""
 
 _THEME_SCRIPT = """<script>
-(function () {
+(function () {{
   var k = 'admin_theme';
-  function apply(t) {
+  function apply(t) {{
     document.documentElement.setAttribute('data-theme', t);
     localStorage.setItem(k, t);
-    document.querySelectorAll('[data-theme-set]').forEach(function (b) {
+    document.querySelectorAll('[data-theme-set]').forEach(function (b) {{
       b.classList.toggle('active', b.getAttribute('data-theme-set') === t);
-    });
-  }
-  function current() {
+    }});
+  }}
+  function current() {{
     return document.documentElement.getAttribute('data-theme') || 'dark';
-  }
-  document.addEventListener('click', function (e) {
+  }}
+  document.addEventListener('click', function (e) {{
     var btn = e.target.closest('[data-theme-set]');
     if (btn) apply(btn.getAttribute('data-theme-set'));
-  });
+  }});
   apply(current());
-})();
+}})();
 </script>"""
 
 _THEME_TOGGLE = (
@@ -670,7 +670,10 @@ async def login_submit(request: Request):
     ip = request.client.host if request.client else "0.0.0.0"
     if not _check_login_rate(ip):
         return HTMLResponse(
-            content=LOGIN_PAGE.format(flash='<div class="flash err">登录尝试过于频繁，请 60 秒后重试</div>'),
+            content=LOGIN_PAGE.format(
+                flash='<div class="flash err">登录尝试过于频繁，请 60 秒后重试</div>',
+                theme_toggle=_THEME_TOGGLE,
+            ),
             status_code=429,
         )
 
@@ -680,13 +683,19 @@ async def login_submit(request: Request):
 
     if not isinstance(username, str) or not isinstance(password, str):
         return HTMLResponse(
-            content=LOGIN_PAGE.format(flash='<div class="flash err">用户名或密码错误</div>'),
+            content=LOGIN_PAGE.format(
+                flash='<div class="flash err">用户名或密码错误</div>',
+                theme_toggle=_THEME_TOGGLE,
+            ),
             status_code=401,
         )
 
     if not _verify_login(username, password):
         return HTMLResponse(
-            content=LOGIN_PAGE.format(flash='<div class="flash err">用户名或密码错误</div>'),
+            content=LOGIN_PAGE.format(
+                flash='<div class="flash err">用户名或密码错误</div>',
+                theme_toggle=_THEME_TOGGLE,
+            ),
             status_code=401,
         )
 
