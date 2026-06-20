@@ -214,10 +214,39 @@ def _redirect(msg: str, err: bool = False) -> RedirectResponse:
 # NOTE: braces are doubled ({{}}) so Python .format() leaves them as single { }.
 
 _STYLES = """<style>
-  :root {{
+  :root, [data-theme="dark"] {{
     --bg: #0f1419; --card: #1a2129; --border: #2a3441;
+    --input-bg: #212a35; --th-bg: #212a35;
     --text: #e6edf3; --muted: #8b98a5; --accent: #4f9cf9;
+    --accent-hover: #3d8de8;
     --green: #3fb950; --red: #f85149; --orange: #d29922;
+    --sidebar-bg: #1e1b4b;
+    --sidebar-border: rgba(255,255,255,.08);
+    --sidebar-divider: rgba(255,255,255,.1);
+    --sidebar-title: #fff;
+    --sidebar-sub: rgba(255,255,255,.45);
+    --sidebar-user: rgba(255,255,255,.65);
+    --sidebar-nav: rgba(255,255,255,.7);
+    --sidebar-nav-hover-bg: rgba(255,255,255,.08);
+    --sidebar-nav-active-bg: rgba(255,255,255,.13);
+    --sidebar-nav-active: #fff;
+  }}
+  [data-theme="light"] {{
+    --bg: #f0f4f8; --card: #ffffff; --border: #d0d7de;
+    --input-bg: #ffffff; --th-bg: #f6f8fa;
+    --text: #1f2328; --muted: #656d76; --accent: #0969da;
+    --accent-hover: #0550ae;
+    --green: #1a7f37; --red: #cf222e; --orange: #9a6700;
+    --sidebar-bg: #ffffff;
+    --sidebar-border: #d0d7de;
+    --sidebar-divider: #d0d7de;
+    --sidebar-title: #1f2328;
+    --sidebar-sub: #656d76;
+    --sidebar-user: #656d76;
+    --sidebar-nav: #656d76;
+    --sidebar-nav-hover-bg: #f6f8fa;
+    --sidebar-nav-active-bg: #ddf4ff;
+    --sidebar-nav-active: #0969da;
   }}
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
@@ -238,7 +267,7 @@ _STYLES = """<style>
   .card .value {{ font-size: 24px; font-weight: 600; margin-top: 6px; }}
   h2 {{ font-size: 15px; margin: 26px 0 10px; color: var(--accent); }}
   table {{ width: 100%; border-collapse: collapse; background: var(--card); border-radius: 10px; overflow: hidden; font-size: 13px; }}
-  th {{ text-align: left; padding: 9px 12px; background: #212a35; color: var(--muted); font-weight: 500; white-space: nowrap; }}
+  th {{ text-align: left; padding: 9px 12px; background: var(--th-bg); color: var(--muted); font-weight: 500; white-space: nowrap; }}
   td {{ padding: 8px 12px; border-top: 1px solid var(--border); vertical-align: middle; }}
   .tag {{ display: inline-block; padding: 1px 8px; border-radius: 20px; font-size: 11px; }}
   .tag.active, .tag.fulfilled {{ background: rgba(63,185,80,.15); color: var(--green); }}
@@ -247,7 +276,7 @@ _STYLES = """<style>
   .empty {{ color: var(--muted); padding: 16px; text-align: center; }}
   form.inline {{ display: inline-flex; gap: 4px; align-items: center; margin: 0; }}
   input, select, button {{
-    background: #212a35; color: var(--text); border: 1px solid var(--border);
+    background: var(--input-bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 5px 8px; font-size: 12px;
   }}
   input:focus, select:focus {{ outline: 1px solid var(--accent); }}
@@ -296,35 +325,56 @@ _STYLES = """<style>
   body.layout-body {{ padding: 0; max-width: none; }}
   .layout {{ display: flex; min-height: 100vh; }}
   .sidebar {{
-    width: 220px; min-width: 220px; background: #1e1b4b;
+    width: 220px; min-width: 220px; background: var(--sidebar-bg);
     display: flex; flex-direction: column;
-    border-right: 1px solid rgba(255,255,255,.08);
+    border-right: 1px solid var(--sidebar-border);
   }}
   .sidebar-brand {{
     padding: 20px 16px 16px;
-    border-bottom: 1px solid rgba(255,255,255,.1);
+    border-bottom: 1px solid var(--sidebar-divider);
   }}
   .brand-title {{
-    font-size: 15px; font-weight: 700; color: #fff; line-height: 1.3;
+    font-size: 15px; font-weight: 700; color: var(--sidebar-title); line-height: 1.3;
   }}
-  .brand-sub {{ font-size: 11px; color: rgba(255,255,255,.45); margin-top: 2px; }}
-  .brand-user {{ font-size: 12px; color: rgba(255,255,255,.65); margin-top: 8px; }}
+  .brand-sub {{ font-size: 11px; color: var(--sidebar-sub); margin-top: 2px; }}
+  .brand-user {{ font-size: 12px; color: var(--sidebar-user); margin-top: 8px; }}
   .sidebar-nav {{
     flex: 1; padding: 8px 0; display: flex; flex-direction: column;
   }}
   .nav-item {{
     display: flex; align-items: center; gap: 10px;
-    padding: 11px 18px; color: rgba(255,255,255,.7);
+    padding: 11px 18px; color: var(--sidebar-nav);
     text-decoration: none; font-size: 13px;
     transition: background .15s; border-left: 3px solid transparent;
   }}
-  .nav-item:hover {{ background: rgba(255,255,255,.08); color: #fff; }}
+  .nav-item:hover {{ background: var(--sidebar-nav-hover-bg); color: var(--sidebar-nav-active); }}
   .nav-item.active {{
-    background: rgba(255,255,255,.13); color: #fff; font-weight: 500;
+    background: var(--sidebar-nav-active-bg); color: var(--sidebar-nav-active); font-weight: 500;
     border-left-color: var(--accent);
   }}
-  .nav-item.nav-logout {{ color: #f85149; margin-top: auto; }}
+  .sidebar-footer {{
+    border-top: 1px solid var(--sidebar-divider);
+    padding: 8px 0;
+  }}
+  .theme-switcher {{
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 18px 8px;
+  }}
+  .theme-label {{ font-size: 12px; color: var(--sidebar-sub); flex: 1; }}
+  .theme-btn {{
+    background: transparent; border: 1px solid var(--sidebar-divider);
+    border-radius: 8px; padding: 5px 10px; font-size: 15px;
+    cursor: pointer; line-height: 1; opacity: .55;
+    color: inherit;
+  }}
+  .theme-btn:hover {{ opacity: .85; background: var(--sidebar-nav-hover-bg); }}
+  .theme-btn.active {{ opacity: 1; border-color: var(--accent); background: var(--sidebar-nav-active-bg); }}
+  .nav-item.nav-logout {{ color: var(--red); }}
   .nav-item.nav-logout:hover {{ background: rgba(248,81,73,.1); }}
+  .login-theme {{
+    position: fixed; top: 16px; right: 16px;
+    display: flex; gap: 6px; z-index: 10;
+  }}
   .nav-icon {{ width: 18px; text-align: center; }}
   .main-content {{ flex: 1; padding: 28px 32px; overflow: auto; min-width: 0; }}
   .page-hdr {{ margin-bottom: 22px; }}
@@ -348,7 +398,7 @@ _STYLES = """<style>
   .frow input[type=text], .frow input[type=number],
   .frow input[type=password], .frow textarea {{
     width: 100%; max-width: 500px; padding: 9px 12px; font-size: 13px;
-    border-radius: 8px; background: #212a35; color: var(--text);
+    border-radius: 8px; background: var(--input-bg); color: var(--text);
     border: 1px solid var(--border); display: block;
   }}
   .frow input:focus, .frow textarea:focus {{ outline: 1px solid var(--accent); }}
@@ -359,10 +409,46 @@ _STYLES = """<style>
     padding: 10px 36px; font-size: 14px; border-radius: 8px;
     cursor: pointer; font-weight: 500;
   }}
-  .btn-save:hover {{ background: #3d8de8; }}
+  .btn-save:hover {{ background: var(--accent-hover); }}
   .backend-section.hidden {{ display: none; }}
   .backend-hint {{ color: var(--muted); font-size: 12px; margin: 4px 0 18px; line-height: 1.5; }}
 </style>"""
+
+_THEME_BOOTSTRAP = """<script>
+(function () {
+  var k = 'admin_theme', s = localStorage.getItem(k);
+  var t = s || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>"""
+
+_THEME_SCRIPT = """<script>
+(function () {
+  var k = 'admin_theme';
+  function apply(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    localStorage.setItem(k, t);
+    document.querySelectorAll('[data-theme-set]').forEach(function (b) {
+      b.classList.toggle('active', b.getAttribute('data-theme-set') === t);
+    });
+  }
+  function current() {
+    return document.documentElement.getAttribute('data-theme') || 'dark';
+  }
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-theme-set]');
+    if (btn) apply(btn.getAttribute('data-theme-set'));
+  });
+  apply(current());
+})();
+</script>"""
+
+_THEME_TOGGLE = (
+    '<button type="button" class="theme-btn" data-theme-set="dark" title="暗色" aria-label="暗色">🌙</button>'
+    '<button type="button" class="theme-btn" data-theme-set="light" title="亮色" aria-label="亮色">☀️</button>'
+)
+
+_HEAD_ASSETS = _THEME_BOOTSTRAP + _STYLES
 
 # ----------------------------------------------------------------- login page
 
@@ -372,9 +458,10 @@ LOGIN_PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin Login</title>
-""" + _STYLES + """
+""" + _HEAD_ASSETS + """
 </head>
 <body>
+<div class="login-theme">{theme_toggle}</div>
 <div class="login-wrap">
   <div class="login-box">
     <h1>管理后台</h1>
@@ -387,6 +474,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
     </form>
   </div>
 </div>
+""" + _THEME_SCRIPT + """
 </body>
 </html>"""
 
@@ -398,7 +486,7 @@ CHANGE_PASSWORD_PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>修改密码 — 管理后台</title>
-""" + _STYLES + """
+""" + _HEAD_ASSETS + """
 </head>
 <body class="layout-body">
 <div class="layout">
@@ -427,6 +515,7 @@ CHANGE_PASSWORD_PAGE = """<!DOCTYPE html>
 </div>
 </main>
 </div>
+""" + _THEME_SCRIPT + """
 </body>
 </html>"""
 
@@ -438,7 +527,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>管理后台 — 首页</title>
-""" + _STYLES + """
+""" + _HEAD_ASSETS + """
 </head>
 <body class="layout-body">
 <div class="layout">
@@ -513,6 +602,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
 </main>
 </div>
+""" + _THEME_SCRIPT + """
 </body>
 </html>"""
 
@@ -539,8 +629,14 @@ def _nav_html(active: str, username: str) -> str:
             f'<span class="nav-icon">{icon}</span>{_esc(label)}</a>'
         )
     items += (
+        '<div class="sidebar-footer">'
+        '<div class="theme-switcher">'
+        '<span class="theme-label">主题</span>'
+        f'{_THEME_TOGGLE}'
+        '</div>'
         '<a class="nav-item nav-logout" href="/admin/logout">'
         '<span class="nav-icon">🚪</span>退出登录</a>'
+        '</div>'
     )
     return (
         '<aside class="sidebar">'
@@ -566,7 +662,7 @@ async def login_page(request: Request, msg: str = ""):
     if msg:
         flash = f'<div class="flash err">{_esc(msg)}</div>'
 
-    return HTMLResponse(content=LOGIN_PAGE.format(flash=flash))
+    return HTMLResponse(content=LOGIN_PAGE.format(flash=flash, theme_toggle=_THEME_TOGGLE))
 
 
 @admin_panel_router.post("/admin/login", response_class=HTMLResponse)
@@ -1197,7 +1293,7 @@ SETTINGS_PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>支付设置 — 管理后台</title>
-""" + _STYLES + """
+""" + _HEAD_ASSETS + """
 </head>
 <body class="layout-body">
 <div class="layout">
@@ -1239,6 +1335,7 @@ SETTINGS_PAGE = """<!DOCTYPE html>
   updateBackendSections();
 }})();
 </script>
+""" + _THEME_SCRIPT + """
 </body>
 </html>"""
 
@@ -1387,7 +1484,7 @@ BOT_CONFIG_PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>机器人配置 — 管理后台</title>
-""" + _STYLES + """
+""" + _HEAD_ASSETS + """
 </head>
 <body class="layout-body">
 <div class="layout">
@@ -1457,6 +1554,7 @@ BOT_CONFIG_PAGE = """<!DOCTYPE html>
 
 </main>
 </div>
+""" + _THEME_SCRIPT + """
 </body>
 </html>"""
 
