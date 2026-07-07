@@ -16,6 +16,8 @@ BOT_CONFIG_KEYS = {
     "bot_token",
     "admin_usernames",
     "welcome_message",
+    "vip_group_url",
+    "vip_channel_url",
     "order_timeout_minutes",
     "expiry_reminder_days",
     "expiry_reminder_message",

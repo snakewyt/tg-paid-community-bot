@@ -80,7 +80,10 @@ class Settings(BaseSettings):
 
     # --- Bot behavior (configurable via admin panel) ---
     admin_usernames: str = ""  # comma-separated TG usernames; grants admin with admin_ids
-    welcome_message: str = "欢迎使用VIP会员购买机器人！\n\n请选择您需要的服务："
+    welcome_message: str = "欢迎使用VIP会员购买机器人！"
+    # Entry links shown by the persistent bottom menu (empty = hide the button)
+    vip_group_url: str = ""
+    vip_channel_url: str = ""
     order_timeout_minutes: int = 30
     expiry_reminder_days: int = 3
     expiry_reminder_message: str = "您的会员将在 {days} 天后到期，请及时续费！"

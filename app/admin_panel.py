@@ -1528,7 +1528,7 @@ BOT_CONFIG_PAGE = """<!DOCTYPE html>
   <div class="frow">
     <label>机器人欢迎语</label>
     <textarea name="welcome_message" rows="4">{welcome_message}</textarea>
-    <div class="fhint">用户首次使用 /start 命令时显示的欢迎语</div>
+    <div class="fhint">全新用户打开机器人时，Telegram 会自动显示 <strong>START</strong> 按钮，点一下即发送 /start 并触发欢迎语与底部菜单；老用户也可随时发 /start 刷新菜单</div>
   </div>
 
   <div class="frow">
@@ -1536,6 +1536,24 @@ BOT_CONFIG_PAGE = """<!DOCTYPE html>
     <input type="number" name="order_timeout_minutes" value="{order_timeout_minutes}"
       min="1" max="1440" style="max-width:180px">
     <div class="fhint">订单多久未支付将自动过期</div>
+  </div>
+</div>
+
+<div class="sc">
+  <h2>🔗 底部菜单入口链接</h2>
+
+  <div class="frow">
+    <label>VIP 群组链接</label>
+    <input type="text" name="vip_group_url" value="{vip_group_url}"
+      placeholder="https://t.me/+xxxx 或 https://t.me/组名">
+    <div class="fhint">填写后，机器人底部菜单会显示「👥 VIP群组」按钮；留空则隐藏该按钮</div>
+  </div>
+
+  <div class="frow">
+    <label>VIP 频道链接</label>
+    <input type="text" name="vip_channel_url" value="{vip_channel_url}"
+      placeholder="https://t.me/+xxxx 或 https://t.me/频道名">
+    <div class="fhint">填写后，机器人底部菜单会显示「📢 VIP频道」按钮；留空则隐藏该按钮</div>
   </div>
 </div>
 
@@ -1576,6 +1594,8 @@ def _render_bot_config_page(cfg: dict, username: str, csrf_token: str, flash: st
         bot_token="",
         admin_usernames=_esc(cfg.get("admin_usernames", "")),
         welcome_message=_esc(cfg.get("welcome_message", "")),
+        vip_group_url=_esc(cfg.get("vip_group_url", "")),
+        vip_channel_url=_esc(cfg.get("vip_channel_url", "")),
         order_timeout_minutes=_esc(cfg.get("order_timeout_minutes", "30")),
         expiry_reminder_days=_esc(cfg.get("expiry_reminder_days", "3")),
         expiry_reminder_message=_esc(cfg.get("expiry_reminder_message", "")),
