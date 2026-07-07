@@ -557,14 +557,19 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <h2>套餐管理</h2>
 <form method="post" action="/admin/plans/create" style="margin:0">
 <input type="hidden" name="csrf_token" value="{csrf_token}">
-<datalist id="chat_id_list">{chat_options}</datalist>
 <div class="formrow" style="flex-direction:column;align-items:stretch;gap:10px">
   <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
     <span>新增套餐:</span>
     <input class="w130" name="name" placeholder="名称" required>
     <input class="w60" name="duration_days" type="number" min="1" placeholder="天数" required>
-    <input class="w160" name="chat_id" list="chat_id_list" placeholder="选择或输入 chat_id"
-      required title="可从下拉选择机器人已加入的群/频道，也可手动输入；创建后不可修改">
+    <select class="w160" id="chat_id_picker"
+      onchange="if(this.value){{document.getElementById('chat_id_input').value=this.value;}}"
+      title="选择机器人已加入的群/频道，会自动填入右侧输入框">
+      <option value="">▼ 选择已加入的群/频道</option>
+      {chat_options}
+    </select>
+    <input class="w160" id="chat_id_input" name="chat_id" placeholder="或手动输入 chat_id"
+      required title="可从左侧下拉选择，也可手动输入；创建后不可修改">
   </div>
   <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
     <span style="color:var(--muted);font-size:12px">价格 (填0=不启用该渠道):</span>
