@@ -31,6 +31,7 @@ from app.config import settings
 from app.constants import PROVIDER_LABELS
 from app.database import async_session_factory
 from app.models.models import (
+    BotChat,
     Order,
     OrderStatus,
     Plan,
@@ -550,15 +551,20 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <h2>收入按支付渠道</h2>
 {provider_table}
 
+<h2>机器人已加入的群组 / 频道</h2>
+{bot_chats_table}
+
 <h2>套餐管理</h2>
 <form method="post" action="/admin/plans/create" style="margin:0">
 <input type="hidden" name="csrf_token" value="{csrf_token}">
+<datalist id="chat_id_list">{chat_options}</datalist>
 <div class="formrow" style="flex-direction:column;align-items:stretch;gap:10px">
   <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
     <span>新增套餐:</span>
     <input class="w130" name="name" placeholder="名称" required>
     <input class="w60" name="duration_days" type="number" min="1" placeholder="天数" required>
-    <input class="w160" name="chat_id" placeholder="群/频道 chat_id" required title="创建后不可修改">
+    <input class="w160" name="chat_id" list="chat_id_list" placeholder="选择或输入 chat_id"
+      required title="可从下拉选择机器人已加入的群/频道，也可手动输入；创建后不可修改">
   </div>
   <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
     <span style="color:var(--muted);font-size:12px">价格 (填0=不启用该渠道):</span>
@@ -891,6 +897,14 @@ async def admin_dashboard(request: Request):
 
         plans = (await session.execute(select(Plan))).scalars().all()
 
+        bot_chats = (
+            await session.execute(
+                select(BotChat)
+                .where(BotChat.is_member == True)  # noqa: E712
+                .order_by(BotChat.is_admin.desc(), BotChat.updated_at.desc())
+            )
+        ).scalars().all()
+
         recent_orders = (
             await session.execute(
                 select(Order).order_by(Order.created_at.desc()).limit(20)
@@ -979,6 +993,43 @@ async def admin_dashboard(request: Request):
     else:
         plans_table = '<table><tr><td class="empty">暂无套餐,用上方表单创建</td></tr></table>'
 
+    # --- bot chats table + datalist options for the plan chat_id field ---
+    _CHAT_TYPE_LABELS = {"group": "群组", "supergroup": "超级群", "channel": "频道"}
+    if bot_chats:
+        rows = []
+        for c in bot_chats:
+            type_label = _CHAT_TYPE_LABELS.get(c.type or "", c.type or "-")
+            admin_tag = (
+                '<span class="tag active">管理员</span>'
+                if c.is_admin
+                else '<span class="tag inactive">非管理员</span>'
+            )
+            uname = f"@{_esc(c.username)}" if c.username else "—"
+            rows.append(
+                f"<tr><td>{_esc(c.title or '(未命名)')}</td>"
+                f"<td>{_esc(type_label)}</td>"
+                f"<td>{uname}</td>"
+                f"<td><code>{c.chat_id}</code></td>"
+                f"<td>{admin_tag}</td></tr>"
+            )
+        bot_chats_table = (
+            "<table><tr><th>名称</th><th>类型</th><th>用户名</th>"
+            "<th>chat_id</th><th>机器人权限</th></tr>" + "".join(rows) + "</table>"
+        )
+    else:
+        bot_chats_table = (
+            '<table><tr><td class="empty">机器人还没有加入任何群/频道。'
+            '把机器人加入群组并设为管理员后，这里会自动出现。</td></tr></table>'
+        )
+
+    chat_options = "".join(
+        f'<option value="{c.chat_id}">'
+        f'{_esc(c.title or "(未命名)")}'
+        f'{" @" + _esc(c.username) if c.username else ""}'
+        f'{"" if c.is_admin else " · 非管理员"}</option>'
+        for c in bot_chats
+    )
+
     # --- subscriptions table with manage actions ---
     if subs:
         now = utcnow()
@@ -1044,6 +1095,8 @@ async def admin_dashboard(request: Request):
         orders_7d=orders_7d,
         revenue_cards=revenue_cards,
         provider_table=provider_table,
+        bot_chats_table=bot_chats_table,
+        chat_options=chat_options,
         plans_table=plans_table,
         grant_options=grant_options,
         subs_table=subs_table,

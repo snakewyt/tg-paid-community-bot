@@ -8,6 +8,7 @@ import logging
 import uvicorn
 
 from app.bot.admin_handlers import admin_router
+from app.bot.chat_member_handlers import chat_member_router
 from app.bot.dispatcher import bot, dp
 from app.bot.join_handlers import join_router
 from app.bot.payment_handlers import payment_router
@@ -44,6 +45,7 @@ def main():
     dp.include_router(payment_router)
     dp.include_router(admin_router)
     dp.include_router(join_router)
+    dp.include_router(chat_member_router)
 
     async def startup():
         init_payment_config()
