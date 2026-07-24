@@ -29,9 +29,11 @@ from app.services.promo import (
     campaign_is_usable,
     clear_user_discount_promo,
     find_discount_by_payload,
+    find_discount_row_by_code,
     get_promo,
     get_user_discount_promo_id,
-    set_user_discount_promo,
+    looks_like_promo_code_message,
+    redeem_discount_promo,
     user_matches_audience,
 )
 user_router = Router()
@@ -42,6 +44,14 @@ BTN_VIP_CHANNEL = "📢 VIP频道"
 BTN_MY_ORDERS = "📋 我的订单"
 BTN_PROFILE = "👤 个人中心"
 BTN_BUY = "🛒 购买/续费"
+
+_MENU_BUTTON_TEXTS = {
+    BTN_VIP_GROUP,
+    BTN_VIP_CHANNEL,
+    BTN_MY_ORDERS,
+    BTN_PROFILE,
+    BTN_BUY,
+}
 
 _ORDER_STATUS_LABELS = {
     OrderStatus.pending: "待支付",
@@ -205,31 +215,8 @@ async def cmd_start(message: Message, command: CommandObject):
         async with async_session_factory() as session:
             promo = await find_discount_by_payload(session, payload)
             if promo is not None:
-                if not await user_matches_audience(session, message.from_user.id, promo):
-                    clear_user_discount_promo(message.from_user.id)
-                    promo_note = (
-                        "\n\n⚠️ 此优惠仅限"
-                        + (
-                            "新用户"
-                            if getattr(promo.audience, "value", promo.audience) == "new"
-                            else "老用户"
-                        )
-                        + "，您不符合条件。"
-                    )
-                else:
-                    set_user_discount_promo(message.from_user.id, promo.id)
-                    plan = await session.get(Plan, promo.plan_id)
-                    plan_name = plan.name if plan else f"套餐#{promo.plan_id}"
-                    if promo.discount_percent:
-                        promo_note = (
-                            f"\n\n🎁 已应用优惠：<b>{plan_name}</b> {promo.discount_percent}% OFF"
-                        )
-                    elif promo.discount_amount:
-                        promo_note = (
-                            f"\n\n🎁 已应用优惠：<b>{plan_name}</b> 减免 {promo.discount_amount:g}"
-                        )
-                    else:
-                        promo_note = f"\n\n🎁 已应用优惠：<b>{plan_name}</b>"
+                note = await redeem_discount_promo(session, message.from_user.id, promo)
+                promo_note = f"\n\n{note}"
             else:
                 clear_user_discount_promo(message.from_user.id)
                 promo_note = "\n\n⚠️ 优惠链接无效或已用完。"
@@ -359,6 +346,31 @@ async def on_menu_profile(message: Message):
         lines.append("暂无有效会员，点「🛒 购买/续费」开通。")
 
     await message.answer("\n".join(lines))
+
+
+@user_router.message(
+    F.text,
+    F.chat.type == "private",
+    ~F.text.startswith("/"),
+)
+async def on_promo_code_text(message: Message):
+    """Redeem discount by sending the promo code as plain text in private chat."""
+    text = (message.text or "").strip()
+    if text in _MENU_BUTTON_TEXTS:
+        return
+    if not looks_like_promo_code_message(text):
+        return
+
+    await _ensure_user(message.from_user)
+    async with async_session_factory() as session:
+        promo = await find_discount_row_by_code(session, text)
+        if promo is None:
+            # Unknown token that only looks like a code — stay silent.
+            return
+        feedback = await redeem_discount_promo(
+            session, message.from_user.id, promo, buy_hint=True
+        )
+    await message.answer(feedback)
 
 
 @user_router.callback_query(F.data.startswith("plan_select:"))

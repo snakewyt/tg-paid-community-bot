@@ -1415,8 +1415,8 @@ MEMBERS_PAGE = """<!DOCTYPE html>
 </form>
 {trial_table}
 
-<h2>付费折扣链接</h2>
-<p style="color:var(--muted);font-size:13px;margin:0 0 10px">用户打开 <code>t.me/Bot?start=promo_xxx</code> 后购买对应套餐按折扣计费；改折扣只影响之后新订单。可限制仅新用户或仅老用户。</p>
+<h2>付费折扣 / 优惠码</h2>
+<p style="color:var(--muted);font-size:13px;margin:0 0 10px">创建后得到<strong>优惠码</strong>（用户私聊机器人直接发送即可兑换）和深链 <code>t.me/Bot?start=promo_xxx</code>。购买对应套餐按折扣计费；改折扣只影响之后新订单。可限制仅新用户或仅老用户。</p>
 <form method="post" action="/admin/promos/discount/create" style="margin:0 0 12px">
 <input type="hidden" name="csrf_token" value="{csrf_token}">
 <div class="formrow" style="flex-wrap:wrap">
@@ -1427,10 +1427,12 @@ MEMBERS_PAGE = """<!DOCTYPE html>
     <option value="new">仅新用户</option>
     <option value="returning">仅老用户</option>
   </select>
+  <input class="w100" name="code" placeholder="优惠码(可空)" maxlength="16"
+    title="4–16 位字母数字；留空自动生成" style="text-transform:uppercase">
   <input class="w60" name="discount_percent" type="number" min="0" max="99" placeholder="%OFF" value="0">
   <input class="w80" name="discount_amount" type="number" step="0.01" min="0" placeholder="减免额" value="0" title="百分比优先；都填0无效">
   <input class="w60" name="max_uses" type="number" min="0" placeholder="上限" value="0" title="0=不限">
-  <button type="submit">创建折扣链接</button>
+  <button type="submit">创建折扣</button>
 </div>
 </form>
 {discount_table}
@@ -1595,6 +1597,7 @@ async def members_page(request: Request):
             f"<tr><td>{p.id}</td><td>{_esc(p.name)}</td>"
             f"<td>{_esc(plan_names.get(p.plan_id, p.plan_id))}</td>"
             f"<td>{_esc(aud)}</td>"
+            f"<td><code>{_esc(p.code or '—')}</code></td>"
             f"<td><form class='inline' method='post' action='/admin/promos/discount/update'>"
             f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
             f"<input type='hidden' name='promo_id' value='{p.id}'>"
@@ -1609,9 +1612,9 @@ async def members_page(request: Request):
             f"<button type='submit'>{'停用' if p.is_active else '启用'}</button></form></td></tr>"
         )
     discount_table = (
-        "<table><tr><th>ID</th><th>名称</th><th>套餐</th><th>适用</th><th>折扣</th>"
+        "<table><tr><th>ID</th><th>名称</th><th>套餐</th><th>适用</th><th>优惠码</th><th>折扣</th>"
         "<th>已用</th><th>状态</th><th>start 参数</th><th>操作</th></tr>"
-        + ("".join(disc_rows) if disc_rows else '<tr><td class="empty" colspan="9">暂无折扣链接</td></tr>')
+        + ("".join(disc_rows) if disc_rows else '<tr><td class="empty" colspan="10">暂无折扣活动</td></tr>')
         + "</table>"
     )
 
@@ -1823,6 +1826,7 @@ async def promo_discount_create(
     name: str = Form(...),
     plan_id: int = Form(...),
     audience: str = Form("all"),
+    code: str = Form(""),
     discount_percent: int = Form(0),
     discount_amount: float = Form(0),
     max_uses: int = Form(0),
@@ -1834,13 +1838,17 @@ async def promo_discount_create(
     if discount_percent < 0 or discount_percent > 99:
         return _redirect("折扣百分比须在 0–99", err=True, to="/admin/members")
 
-    from app.services.promo import make_start_payload, parse_audience
+    from app.services.promo import allocate_unique_code, make_start_payload, parse_audience
     audience_val = parse_audience(audience)
 
     async with async_session_factory() as session:
         plan = await session.get(Plan, plan_id)
         if not plan or not plan.is_active:
             return _redirect("套餐不存在或已停用", err=True, to="/admin/members")
+        try:
+            promo_code = await allocate_unique_code(session, code or None)
+        except ValueError as e:
+            return _redirect(str(e), err=True, to="/admin/members")
         payload = make_start_payload()
         promo = PromoCampaign(
             name=name.strip() or "折扣活动",
@@ -1851,11 +1859,13 @@ async def promo_discount_create(
             discount_amount=float(discount_amount or 0),
             max_uses=max(0, max_uses),
             start_payload=payload,
+            code=promo_code,
             is_active=True,
         )
         session.add(promo)
         await session.commit()
         payload_saved = payload
+        code_saved = promo_code
 
     bot_username = ""
     try:
@@ -1869,7 +1879,10 @@ async def promo_discount_create(
         if bot_username
         else f"?start={payload_saved}"
     )
-    return _redirect(f"折扣链接已创建：{link}", to="/admin/members")
+    return _redirect(
+        f"折扣已创建：优惠码 {code_saved}；深链 {link}",
+        to="/admin/members",
+    )
 
 
 @admin_panel_router.post("/admin/promos/discount/update")

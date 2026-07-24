@@ -149,6 +149,8 @@ class PromoCampaign(Base):
     invite_link: Mapped[Optional[str]] = mapped_column(String(512))
     invite_link_name: Mapped[Optional[str]] = mapped_column(String(64))
     start_payload: Mapped[Optional[str]] = mapped_column(String(64))
+    # Human-readable promo code for in-bot redemption (uppercase A-Z0-9).
+    code: Mapped[Optional[str]] = mapped_column(String(16), unique=True)
     is_active: Mapped[bool] = mapped_column(default=True)
     link_expire_at: Mapped[Optional[datetime]] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
