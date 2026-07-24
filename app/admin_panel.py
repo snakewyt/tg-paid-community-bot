@@ -1499,15 +1499,35 @@ async def members_page(request: Request):
         from app.services.promo import list_promos
         trials = await list_promos(session, kind=PromoKind.trial)
         discounts = await list_promos(session, kind=PromoKind.discount)
+        bot_chats = (
+            await session.execute(
+                select(BotChat).where(BotChat.is_member == True)  # noqa: E712
+            )
+        ).scalars().all()
+        chat_titles = {
+            c.chat_id: (c.title or "").strip() or str(c.chat_id) for c in bot_chats
+        }
 
     flash = ""
     if msg:
         cls = "flash err" if msg_type == "err" else "flash"
         flash = f'<div class="{cls}">{_esc(msg)}</div>'
 
+    active_plans = [p for p in plans if p.is_active]
+    chat_plan_counts: dict[int, int] = {}
+    for p in active_plans:
+        chat_plan_counts[p.chat_id] = chat_plan_counts.get(p.chat_id, 0) + 1
+
+    def _plan_select_label(p: Plan) -> str:
+        title = chat_titles.get(p.chat_id) or f"群 {p.chat_id}"
+        # Same group with multiple plans: keep group name primary, append plan name.
+        if chat_plan_counts.get(p.chat_id, 0) > 1:
+            return f"{title} · {p.name}"
+        return title
+
     grant_options = "".join(
-        f'<option value="{p.id}">{_esc(p.name)} (ID:{p.id}, {p.duration_days}天)</option>'
-        for p in plans if p.is_active
+        f'<option value="{p.id}">{_esc(_plan_select_label(p))}</option>'
+        for p in active_plans
     ) or '<option value="">无可用套餐</option>'
 
     if subs:
