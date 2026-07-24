@@ -213,6 +213,36 @@ def _redirect(msg: str, err: bool = False, *, to: str = "/admin") -> RedirectRes
     return RedirectResponse(url=f"{to}?msg={quote(msg)}&t={flag}", status_code=303)
 
 
+def _subscription_plan_label(
+    *,
+    plan_id: int,
+    plan_names: dict[int, str],
+    order: Order | None,
+    promo_by_id: dict[int, PromoCampaign],
+) -> str:
+    """Plan name for paid/grant; trial campaign name when order is from a trial promo."""
+    if order and order.promo_id:
+        promo = promo_by_id.get(order.promo_id)
+        if promo is not None:
+            kind = promo.kind.value if hasattr(promo.kind, "value") else str(promo.kind)
+            if kind == PromoKind.trial.value:
+                return promo.name
+    return plan_names.get(plan_id, str(plan_id))
+
+
+def _stack_cell(parts: list[str]) -> str:
+    """Stack multiple lines in one table cell (overlapping memberships)."""
+    if not parts:
+        return "—"
+    if len(parts) == 1:
+        return parts[0]
+    return (
+        "<div style='display:flex;flex-direction:column;gap:6px;line-height:1.35'>"
+        + "".join(f"<div>{p}</div>" for p in parts)
+        + "</div>"
+    )
+
+
 # ---------------------------------------------------------------------- styles
 # Shared CSS block. Kept separate so each template can include it.
 # NOTE: braces are doubled ({{}}) so Python .format() leaves them as single { }.
@@ -1365,24 +1395,10 @@ MEMBERS_PAGE = """<!DOCTYPE html>
 <div class="page-hdr">
   <div>
     <div class="page-title">会员管理</div>
-    <div class="page-sub">赠送、搜索、导出与优惠链接</div>
+    <div class="page-sub">搜索、导出与优惠活动</div>
   </div>
 </div>
 {flash}
-
-<h2>赠送会员</h2>
-<form method="post" action="/admin/subs/grant" style="margin:0">
-<input type="hidden" name="csrf_token" value="{csrf_token}">
-<div class="formrow">
-  <span>用户:</span>
-  <input class="w130" name="user_id" type="text" placeholder="ID 或 @用户名" required>
-  <span>套餐:</span>
-  <select name="plan_id" style="width:180px">{grant_options}</select>
-  <span>天数:</span>
-  <input class="w60" name="days" type="number" min="1" placeholder="天数" required>
-  <button type="submit">赠送</button>
-</div>
-</form>
 
 <h2>活跃会员</h2>
 <div class="formrow">
@@ -1533,6 +1549,19 @@ async def members_page(request: Request):
         ).scalars().all() if sub_user_ids else []
         user_labels = {u.id: format_user_ref(u.id, u.username) for u in sub_users}
 
+        order_ids = {s.order_id for s in subs if s.order_id}
+        orders = (
+            await session.execute(select(Order).where(Order.id.in_(order_ids)))
+        ).scalars().all() if order_ids else []
+        order_map = {o.id: o for o in orders}
+        promo_ids = {o.promo_id for o in orders if o.promo_id}
+        promo_rows = (
+            await session.execute(
+                select(PromoCampaign).where(PromoCampaign.id.in_(promo_ids))
+            )
+        ).scalars().all() if promo_ids else []
+        promo_by_id = {p.id: p for p in promo_rows}
+
         from app.services.promo import list_promos
         trials = await list_promos(session, kind=PromoKind.trial)
         discounts = await list_promos(session, kind=PromoKind.discount)
@@ -1555,11 +1584,10 @@ async def members_page(request: Request):
 
     active_plans = [p for p in plans if p.is_active]
 
-    # 赠送 / 折扣：按套餐完整名称选择
+    # 折扣：按套餐完整名称选择
     plan_name_options = "".join(
         f'<option value="{p.id}">{_esc(p.name)}</option>' for p in active_plans
     ) or '<option value="">无可用套餐</option>'
-    grant_options = plan_name_options
     discount_options = plan_name_options
 
     # 体验：按群/频道去重，只显示社群名称（value 仍为该群下任一启用套餐 ID）
@@ -1574,25 +1602,57 @@ async def members_page(request: Request):
     trial_chat_options = "".join(trial_opts) or '<option value="">无可用群组</option>'
 
     if subs:
+        from collections import defaultdict
+
         now = utcnow()
-        rows = []
+        by_user: dict[int, list[Subscription]] = defaultdict(list)
+        user_order: list[int] = []
         for s in subs:
-            label = _esc(user_labels.get(s.user_id, str(s.user_id)))
+            if s.user_id not in by_user:
+                user_order.append(s.user_id)
+            by_user[s.user_id].append(s)
+
+        rows = []
+        for uid in user_order:
+            user_subs = by_user[uid]
+            label = _esc(user_labels.get(uid, str(uid)))
+            plan_parts = []
+            expire_parts = []
+            remain_parts = []
+            action_parts = []
+            for s in user_subs:
+                plan_parts.append(
+                    _esc(
+                        _subscription_plan_label(
+                            plan_id=s.plan_id,
+                            plan_names=plan_names,
+                            order=order_map.get(s.order_id),
+                            promo_by_id=promo_by_id,
+                        )
+                    )
+                )
+                expire_parts.append(s.expires_at.strftime("%Y-%m-%d %H:%M"))
+                remain_parts.append(f"{max((s.expires_at - now).days, 0)} 天")
+                action_parts.append(
+                    f"<div style='white-space:nowrap'>"
+                    f"<form class='inline' method='post' action='/admin/subs/adjust'>"
+                    f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+                    f"<input type='hidden' name='sub_id' value='{s.id}'>"
+                    f"<input class='w90' name='delta' placeholder='+7 / -3' required>"
+                    f"<button type='submit'>调整</button></form> "
+                    f"<form class='inline' method='post' action='/admin/subs/revoke' "
+                    f"onsubmit=\"return confirm('确认移除该会员并踢出群?')\">"
+                    f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+                    f"<input type='hidden' name='sub_id' value='{s.id}'>"
+                    f"<button type='submit' class='danger'>移除</button></form>"
+                    f"</div>"
+                )
             rows.append(
-                f"<tr><td><a href='/admin/members/{s.user_id}'>{label}</a></td>"
-                f"<td>{_esc(plan_names.get(s.plan_id, s.plan_id))}</td>"
-                f"<td>{s.expires_at.strftime('%Y-%m-%d %H:%M')}</td>"
-                f"<td>{max((s.expires_at - now).days, 0)} 天</td>"
-                f"<td><form class='inline' method='post' action='/admin/subs/adjust'>"
-                f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
-                f"<input type='hidden' name='sub_id' value='{s.id}'>"
-                f"<input class='w90' name='delta' placeholder='+7 / -3' required>"
-                f"<button type='submit'>调整</button></form> "
-                f"<form class='inline' method='post' action='/admin/subs/revoke' "
-                f"onsubmit=\"return confirm('确认移除该会员并踢出群?')\">"
-                f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
-                f"<input type='hidden' name='sub_id' value='{s.id}'>"
-                f"<button type='submit' class='danger'>移除</button></form></td></tr>"
+                f"<tr><td><a href='/admin/members/{uid}'>{label}</a></td>"
+                f"<td>{_stack_cell(plan_parts)}</td>"
+                f"<td>{_stack_cell(expire_parts)}</td>"
+                f"<td>{_stack_cell(remain_parts)}</td>"
+                f"<td>{_stack_cell(action_parts)}</td></tr>"
             )
         subs_table = (
             "<table><tr><th>用户</th><th>套餐</th><th>到期 (UTC)</th>"
@@ -1686,7 +1746,6 @@ async def members_page(request: Request):
         flash=flash,
         csrf_token=_esc(csrf_token),
         q=_esc(q),
-        grant_options=grant_options,
         trial_chat_options=trial_chat_options,
         discount_options=discount_options,
         subs_table=subs_table,
@@ -1737,18 +1796,30 @@ async def members_export(request: Request):
         users = (
             await session.execute(select(User).where(User.id.in_(user_ids)))
         ).scalars().all() if user_ids else []
-        plan_map = {p.id: p for p in plans}
         order_map = {o.id: o for o in orders}
         user_map = {u.id: u for u in users}
+        plan_names = {p.id: p.name for p in plans}
+        promo_ids = {o.promo_id for o in orders if o.promo_id}
+        promo_rows = (
+            await session.execute(
+                select(PromoCampaign).where(PromoCampaign.id.in_(promo_ids))
+            )
+        ).scalars().all() if promo_ids else []
+        promo_by_id = {p.id: p for p in promo_rows}
 
         for s in subs:
-            plan = plan_map.get(s.plan_id)
             order = order_map.get(s.order_id)
             user = user_map.get(s.user_id)
+            label = _subscription_plan_label(
+                plan_id=s.plan_id,
+                plan_names=plan_names,
+                order=order,
+                promo_by_id=promo_by_id,
+            )
             writer.writerow([
                 s.user_id,
                 user.username if user and user.username else "",
-                plan.name if plan else s.plan_id,
+                label,
                 s.group_chat_id,
                 s.expires_at.strftime("%Y-%m-%d %H:%M:%S") if s.expires_at else "",
                 s.status.value if hasattr(s.status, "value") else s.status,
@@ -1830,11 +1901,20 @@ async def member_detail_page(request: Request, user_id: int):
 
         order_ids = [s.order_id for s in subs if s.order_id]
         sub_orders: dict[str, Order] = {}
+        promo_by_id: dict[int, PromoCampaign] = {}
         if order_ids:
             rows = (
                 await session.execute(select(Order).where(Order.id.in_(order_ids)))
             ).scalars().all()
             sub_orders = {o.id: o for o in rows}
+            promo_ids = {o.promo_id for o in rows if o.promo_id}
+            if promo_ids:
+                promo_rows = (
+                    await session.execute(
+                        select(PromoCampaign).where(PromoCampaign.id.in_(promo_ids))
+                    )
+                ).scalars().all()
+                promo_by_id = {p.id: p for p in promo_rows}
 
         orders = (
             await session.execute(
@@ -1875,9 +1955,15 @@ async def member_detail_page(request: Request, user_id: int):
             status = _SUB_STATUS_LABELS.get(s.status, getattr(s.status, "value", str(s.status)))
             group = chat_titles.get(s.group_chat_id) or str(s.group_chat_id)
             oid = (s.order_id or "")[:8] or "—"
+            plan_label = _subscription_plan_label(
+                plan_id=s.plan_id,
+                plan_names=plan_names,
+                order=order,
+                promo_by_id=promo_by_id,
+            )
             sub_rows.append(
                 f"<tr>"
-                f"<td>{_esc(plan_names.get(s.plan_id, s.plan_id))}</td>"
+                f"<td>{_esc(plan_label)}</td>"
                 f"<td>{_esc(group)}</td>"
                 f"<td>{_esc(status)}</td>"
                 f"<td>{s.expires_at.strftime('%Y-%m-%d %H:%M') if s.expires_at else '—'}</td>"
