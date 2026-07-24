@@ -354,41 +354,66 @@ async def on_menu_profile(message: Message):
 )
 async def on_promo_code_text(message: Message):
     """Redeem trial/discount by sending the promo code as plain text in private chat."""
+    import logging
+
+    from app.models.models import PromoKind
+    from app.services.promo import (
+        extract_promo_code,
+        find_promo_row_by_code,
+        promo_kind_value,
+        redeem_trial_promo,
+    )
+
+    log = logging.getLogger(__name__)
     text = (message.text or "").strip()
     if text in _MENU_BUTTON_TEXTS:
         return
     if not looks_like_promo_code_message(text):
         return
 
-    await _ensure_user(message.from_user)
-    async with async_session_factory() as session:
-        from app.models.models import PromoKind
-        from app.services.promo import find_promo_row_by_code, redeem_trial_promo
-
-        promo = await find_promo_row_by_code(session, text)
-        if promo is None:
-            # Unknown token that only looks like a code — stay silent.
-            return
-        if promo.kind == PromoKind.trial:
-            feedback, order_id = await redeem_trial_promo(
-                session, message.from_user.id, promo
-            )
-        else:
-            feedback = await redeem_discount_promo(
-                session, message.from_user.id, promo, buy_hint=True
-            )
-            order_id = None
+    code = extract_promo_code(text) or text.upper()
+    feedback = "⚠️ 优惠码无效或已用完。"
+    order_id: str | None = None
+    try:
+        await _ensure_user(message.from_user)
+        async with async_session_factory() as session:
+            promo = await find_promo_row_by_code(session, text)
+            if promo is None:
+                # Avoid nagging on short English words (e.g. hello); still answer
+                # for code-shaped tokens users are likely redeeming.
+                if len(code) < 6 and not any(c.isdigit() for c in code):
+                    return
+                log.info("Promo code not found user=%s code=%s", message.from_user.id, code)
+            elif promo_kind_value(promo) == PromoKind.trial.value:
+                feedback, order_id = await redeem_trial_promo(
+                    session, message.from_user.id, promo
+                )
+            else:
+                feedback = await redeem_discount_promo(
+                    session, message.from_user.id, promo, buy_hint=True
+                )
+    except Exception:
+        log.exception("Promo redeem failed user=%s code=%s", message.from_user.id, code)
+        feedback = "⚠️ 兑换失败，请稍后重试或联系管理员。"
+        order_id = None
 
     await message.answer(feedback)
     if order_id:
         from app.services.notify import notify_fulfillment
 
-        result = await notify_fulfillment(order_id)
+        try:
+            result = await notify_fulfillment(order_id)
+        except Exception:
+            log.exception("Promo fulfill notify failed order=%s", order_id)
+            await message.answer(
+                "体验已开通，但入群链接发送失败，请联系管理员。"
+            )
+            return
         if result.link and not result.dm_sent:
             await message.answer(f"入群邀请链接：{result.link}")
         elif not result.link:
             await message.answer(
-                "体验已开通，但入群链接创建失败，请联系管理员确认机器人是否为群管理员。"
+                "体验已开通，但入群链接创建失败，请确认机器人是否为群管理员。"
             )
 
 

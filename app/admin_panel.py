@@ -1442,6 +1442,43 @@ MEMBERS_PAGE = """<!DOCTYPE html>
 </html>"""
 
 
+MEMBER_DETAIL_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>用户详情 — 管理后台</title>
+""" + _HEAD_ASSETS + """
+</head>
+<body class="layout-body">
+<div class="layout">
+{sidebar}
+<main class="main-content">
+<div class="page-hdr">
+  <div>
+    <div class="page-title">用户详情</div>
+    <div class="page-sub">{user_label}</div>
+  </div>
+  <a class="btn-save" href="/admin/members" style="text-decoration:none;display:inline-block;padding:8px 14px">← 返回会员管理</a>
+</div>
+{flash}
+
+<h2>基本信息</h2>
+{profile_table}
+
+<h2>全部订阅</h2>
+{subs_table}
+
+<h2>订单历史</h2>
+{orders_table}
+
+</main>
+</div>
+""" + _THEME_SCRIPT + """
+</body>
+</html>"""
+
+
 def _parse_optional_datetime(raw: str):
     raw = (raw or "").strip()
     if not raw:
@@ -1540,8 +1577,9 @@ async def members_page(request: Request):
         now = utcnow()
         rows = []
         for s in subs:
+            label = _esc(user_labels.get(s.user_id, str(s.user_id)))
             rows.append(
-                f"<tr><td>{_esc(user_labels.get(s.user_id, str(s.user_id)))}</td>"
+                f"<tr><td><a href='/admin/members/{s.user_id}'>{label}</a></td>"
                 f"<td>{_esc(plan_names.get(s.plan_id, s.plan_id))}</td>"
                 f"<td>{s.expires_at.strftime('%Y-%m-%d %H:%M')}</td>"
                 f"<td>{max((s.expires_at - now).days, 0)} 天</td>"
@@ -1590,11 +1628,11 @@ async def members_page(request: Request):
             f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
             f"<input type='hidden' name='promo_id' value='{p.id}'>"
             f"<button type='submit'>{'停用' if p.is_active else '启用'}</button></form> "
-            f"<form class='inline' method='post' action='/admin/promos/trial/revoke' "
-            f"onsubmit=\"return confirm('撤销该邀请链接?')\">"
+            f"<form class='inline' method='post' action='/admin/promos/trial/delete' "
+            f"onsubmit=\"return confirm('确认删除该体验活动？此操作不可恢复')\">"
             f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
             f"<input type='hidden' name='promo_id' value='{p.id}'>"
-            f"<button type='submit' class='danger'>撤销链接</button></form></td></tr>"
+            f"<button type='submit' class='danger'>删除链接</button></form></td></tr>"
         )
     trial_table = (
         "<table><tr><th>ID</th><th>名称</th><th>群组</th><th>适用</th><th>优惠码</th><th>体验天数</th>"
@@ -1730,6 +1768,175 @@ async def members_export(request: Request):
     )
 
 
+_SUB_STATUS_LABELS = {
+    SubscriptionStatus.active: "有效",
+    SubscriptionStatus.expired: "已过期",
+    SubscriptionStatus.kicked: "已踢出",
+}
+
+_ORDER_STATUS_LABELS = {
+    OrderStatus.pending: "待支付",
+    OrderStatus.paid: "已支付",
+    OrderStatus.fulfilled: "已完成",
+    OrderStatus.expired: "已过期",
+    OrderStatus.cancelled: "已取消",
+}
+
+
+def _order_pay_cells(order: Order | None) -> tuple[str, str]:
+    """Return (provider_label, amount_label) for a subscription's order."""
+    if order is None:
+        return "—", "—"
+    if (order.currency or "").upper() == "GRANT":
+        return "赠送", "0 GRANT"
+    prov = PROVIDER_LABELS.get(order.provider.value, order.provider.value)
+    return prov, f"{order.amount:g} {_esc(order.currency)}"
+
+
+@admin_panel_router.get("/admin/members/{user_id}", response_class=HTMLResponse)
+async def member_detail_page(request: Request, user_id: int):
+    username = _get_session(request)
+    if not username:
+        return RedirectResponse(url="/admin/login", status_code=303)
+    if not _password_changed():
+        return RedirectResponse(
+            url="/admin/change-password?msg=首次登录，请修改默认密码",
+            status_code=303,
+        )
+
+    msg = request.query_params.get("msg", "")
+    msg_type = request.query_params.get("t", "ok")
+
+    async with async_session_factory() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return _redirect(f"用户 {user_id} 不存在", err=True, to="/admin/members")
+
+        plans = (await session.execute(select(Plan))).scalars().all()
+        plan_names = {p.id: p.name for p in plans}
+
+        bot_chats = (await session.execute(select(BotChat))).scalars().all()
+        chat_titles = {
+            c.chat_id: (c.title or "").strip() or str(c.chat_id) for c in bot_chats
+        }
+
+        subs = (
+            await session.execute(
+                select(Subscription)
+                .where(Subscription.user_id == user_id)
+                .order_by(Subscription.expires_at.desc())
+            )
+        ).scalars().all()
+
+        order_ids = [s.order_id for s in subs if s.order_id]
+        sub_orders: dict[str, Order] = {}
+        if order_ids:
+            rows = (
+                await session.execute(select(Order).where(Order.id.in_(order_ids)))
+            ).scalars().all()
+            sub_orders = {o.id: o for o in rows}
+
+        orders = (
+            await session.execute(
+                select(Order)
+                .where(Order.user_id == user_id)
+                .order_by(Order.created_at.desc())
+                .limit(50)
+            )
+        ).scalars().all()
+
+    flash = ""
+    if msg:
+        cls = "flash err" if msg_type == "err" else "flash"
+        flash = f'<div class="{cls}">{_esc(msg)}</div>'
+
+    display_name = " ".join(
+        x for x in [(user.first_name or "").strip(), (user.last_name or "").strip()] if x
+    ) or "—"
+    uname = f"@{user.username}" if user.username else "—"
+    created = (
+        user.created_at.strftime("%Y-%m-%d %H:%M UTC") if user.created_at else "—"
+    )
+    profile_table = (
+        "<table>"
+        f"<tr><th style='width:140px'>用户 ID</th><td><code>{user.id}</code></td></tr>"
+        f"<tr><th>用户名</th><td>{_esc(uname)}</td></tr>"
+        f"<tr><th>昵称</th><td>{_esc(display_name)}</td></tr>"
+        f"<tr><th>语言</th><td>{_esc(user.language_code or '—')}</td></tr>"
+        f"<tr><th>首次互动</th><td>{_esc(created)}</td></tr>"
+        "</table>"
+    )
+
+    if subs:
+        sub_rows = []
+        for s in subs:
+            order = sub_orders.get(s.order_id)
+            pay_label, amount_label = _order_pay_cells(order)
+            status = _SUB_STATUS_LABELS.get(s.status, getattr(s.status, "value", str(s.status)))
+            group = chat_titles.get(s.group_chat_id) or str(s.group_chat_id)
+            oid = (s.order_id or "")[:8] or "—"
+            sub_rows.append(
+                f"<tr>"
+                f"<td>{_esc(plan_names.get(s.plan_id, s.plan_id))}</td>"
+                f"<td>{_esc(group)}</td>"
+                f"<td>{_esc(status)}</td>"
+                f"<td>{s.expires_at.strftime('%Y-%m-%d %H:%M') if s.expires_at else '—'}</td>"
+                f"<td>{s.created_at.strftime('%Y-%m-%d %H:%M') if s.created_at else '—'}</td>"
+                f"<td>{_esc(pay_label)}</td>"
+                f"<td>{amount_label}</td>"
+                f"<td><code>{_esc(oid)}</code></td>"
+                f"</tr>"
+            )
+        subs_table = (
+            "<table><tr><th>套餐</th><th>群组</th><th>状态</th><th>到期 (UTC)</th>"
+            "<th>开通 (UTC)</th><th>支付方式</th><th>金额</th><th>订单</th></tr>"
+            + "".join(sub_rows)
+            + "</table>"
+        )
+    else:
+        subs_table = '<table><tr><td class="empty">暂无订阅记录</td></tr></table>'
+
+    if orders:
+        order_rows = []
+        for o in orders:
+            status = _ORDER_STATUS_LABELS.get(o.status, o.status.value)
+            pay_label, amount_label = _order_pay_cells(o)
+            order_rows.append(
+                f"<tr>"
+                f"<td><code>{_esc(o.id[:8])}</code></td>"
+                f"<td>{_esc(plan_names.get(o.plan_id, o.plan_id))}</td>"
+                f"<td>{_esc(pay_label)}</td>"
+                f"<td>{amount_label}</td>"
+                f"<td><span class=\"tag {_esc(o.status.value)}\">{_esc(status)}</span>"
+                + (
+                    '<span class="tag pending" title="超时关闭后又收到支付">迟付复活</span>'
+                    if getattr(o, "revived", False)
+                    else ""
+                )
+                + "</td>"
+                f"<td>{o.created_at.strftime('%m-%d %H:%M') if o.created_at else '—'}</td>"
+                f"</tr>"
+            )
+        orders_table = (
+            "<table><tr><th>订单</th><th>套餐</th><th>渠道</th><th>金额</th>"
+            "<th>状态</th><th>时间</th></tr>"
+            + "".join(order_rows)
+            + "</table>"
+        )
+    else:
+        orders_table = '<table><tr><td class="empty">暂无订单</td></tr></table>'
+
+    page = MEMBER_DETAIL_PAGE.format(
+        sidebar=_nav_html("members", username),
+        flash=flash,
+        user_label=_esc(format_user_ref(user.id, user.username)),
+        profile_table=profile_table,
+        subs_table=subs_table,
+        orders_table=orders_table,
+    )
+    return HTMLResponse(content=page)
+
+
 @admin_panel_router.post("/admin/promos/trial/create")
 async def promo_trial_create(
     request: Request,
@@ -1826,8 +2033,8 @@ async def promo_trial_update(
     return _redirect(f"体验天数已更新为 {grant_days} 天", to="/admin/members")
 
 
-@admin_panel_router.post("/admin/promos/trial/revoke")
-async def promo_trial_revoke(
+@admin_panel_router.post("/admin/promos/trial/delete")
+async def promo_trial_delete(
     request: Request,
     csrf_token: str = Form(""),
     promo_id: int = Form(...),
@@ -1842,7 +2049,7 @@ async def promo_trial_revoke(
         plan = await session.get(Plan, promo.plan_id)
         link = promo.invite_link
         chat_id = plan.chat_id if plan else None
-        promo.is_active = False
+        await session.delete(promo)
         await session.commit()
 
     if chat_id and link:
@@ -1850,10 +2057,14 @@ async def promo_trial_revoke(
             from app.services.invites import revoke_invite_link
             await revoke_invite_link(chat_id, link)
         except Exception as e:
-            logger.warning("Revoke invite link failed promo=%s: %s", promo_id, e)
-            return _redirect(f"已停用活动，但撤销 Telegram 链接失败: {e}", err=True, to="/admin/members")
+            logger.warning("Delete trial promo: revoke invite failed promo=%s: %s", promo_id, e)
+            return _redirect(
+                f"活动已删除，但 Telegram 邀请链接撤销失败: {e}",
+                err=True,
+                to="/admin/members",
+            )
 
-    return _redirect("体验链接已撤销", to="/admin/members")
+    return _redirect("体验活动已删除", to="/admin/members")
 
 
 @admin_panel_router.post("/admin/promos/discount/create")

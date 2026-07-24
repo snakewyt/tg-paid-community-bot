@@ -61,10 +61,29 @@ def make_promo_code(length: int = 8) -> str:
 
 
 def normalize_code(raw: str | None) -> str | None:
+    """Normalize user/admin input to uppercase A–Z0–9 (strip wrappers/spaces/hyphens)."""
     if raw is None:
         return None
-    code = raw.strip().upper()
-    return code or None
+    text = raw.strip().upper()
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
+    text = text.strip("「」『』\"'`“”‘’[]()（）：:。．.!")
+    compact = re.sub(r"[\s\-_]", "", text)
+    return compact or None
+
+
+def extract_promo_code(raw: str | None) -> str | None:
+    """Pull a single promo-code token from a private-chat message, if present."""
+    code = normalize_code(raw)
+    if is_valid_code_format(code):
+        return code
+    if not raw:
+        return None
+    tokens = re.findall(r"[A-Za-z0-9]{4,16}", raw)
+    if len(tokens) == 1:
+        candidate = tokens[0].upper()
+        if is_valid_code_format(candidate):
+            return candidate
+    return None
 
 
 def is_valid_code_format(code: str | None) -> bool:
@@ -74,10 +93,13 @@ def is_valid_code_format(code: str | None) -> bool:
 
 
 def looks_like_promo_code_message(text: str | None) -> bool:
-    """True if a chat message could be a promo code (exact token, 4–16 A-Z0-9)."""
-    if not text:
-        return False
-    return is_valid_code_format(normalize_code(text))
+    """True if a chat message could be a promo code (4–16 A-Z0-9, optional wrappers)."""
+    return extract_promo_code(text) is not None
+
+
+def promo_kind_value(promo: PromoCampaign) -> str:
+    kind = promo.kind
+    return kind.value if hasattr(kind, "value") else str(kind)
 
 
 def make_invite_link_name(promo_id: int) -> str:
@@ -126,13 +148,15 @@ def _audience_label(promo: PromoCampaign) -> str:
 
 
 def format_discount_success(plan_name: str, promo: PromoCampaign) -> str:
+    from html import escape
+
     if promo.discount_percent:
         detail = f"{promo.discount_percent}% OFF"
     elif promo.discount_amount:
         detail = f"减免 {promo.discount_amount:g}"
     else:
         detail = "优惠价"
-    return f"🎁 已应用优惠：<b>{plan_name}</b> {detail}"
+    return f"🎁 已应用优惠：<b>{escape(plan_name)}</b> {detail}"
 
 
 async def redeem_discount_promo(
@@ -143,7 +167,7 @@ async def redeem_discount_promo(
     buy_hint: bool = False,
 ) -> str:
     """Bind discount promo for user if allowed; return HTML feedback text."""
-    if promo.kind != PromoKind.discount:
+    if promo_kind_value(promo) != PromoKind.discount.value:
         return "⚠️ 优惠码无效或已用完。"
     if not campaign_is_usable(promo):
         clear_user_discount_promo(user_id)
@@ -168,9 +192,11 @@ async def redeem_trial_promo(
     promo: PromoCampaign,
 ) -> tuple[str, str | None]:
     """Grant trial membership for a promo code. Returns (feedback, order_id|None)."""
+    from html import escape
+
     from app.services.grant import grant_subscription
 
-    if promo.kind != PromoKind.trial:
+    if promo_kind_value(promo) != PromoKind.trial.value:
         return "⚠️ 优惠码无效或已用完。", None
     if not campaign_is_usable(promo) or int(promo.grant_days or 0) < 1:
         return "⚠️ 优惠码无效或已用完。", None
@@ -196,7 +222,7 @@ async def redeem_trial_promo(
         logger.error("Trial code redeem failed user=%d promo=%s: %s", user_id, promo.id, e)
         return "⚠️ 兑换失败，请稍后重试或联系管理员。", None
 
-    plan_name = plan.name
+    plan_name = escape(plan.name)
     days = promo.grant_days
     msg = f"🎁 体验已开通：<b>{plan_name}</b> {days} 天。"
     return msg, order.id
@@ -303,7 +329,7 @@ async def find_promo_row_by_code(
     session: AsyncSession, raw: str | None
 ) -> PromoCampaign | None:
     """Find trial or discount campaign by code (any status)."""
-    code = normalize_code(raw)
+    code = extract_promo_code(raw) or normalize_code(raw)
     if not code or not is_valid_code_format(code):
         return None
     return (
