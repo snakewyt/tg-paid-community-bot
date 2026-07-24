@@ -143,6 +143,8 @@ async def redeem_discount_promo(
     buy_hint: bool = False,
 ) -> str:
     """Bind discount promo for user if allowed; return HTML feedback text."""
+    if promo.kind != PromoKind.discount:
+        return "⚠️ 优惠码无效或已用完。"
     if not campaign_is_usable(promo):
         clear_user_discount_promo(user_id)
         return "⚠️ 优惠码无效或已用完。"
@@ -158,6 +160,46 @@ async def redeem_discount_promo(
     if buy_hint:
         msg += "\n\n请点击下方「🛒 购买/续费」使用优惠价下单。"
     return msg
+
+
+async def redeem_trial_promo(
+    session: AsyncSession,
+    user_id: int,
+    promo: PromoCampaign,
+) -> tuple[str, str | None]:
+    """Grant trial membership for a promo code. Returns (feedback, order_id|None)."""
+    from app.services.grant import grant_subscription
+
+    if promo.kind != PromoKind.trial:
+        return "⚠️ 优惠码无效或已用完。", None
+    if not campaign_is_usable(promo) or int(promo.grant_days or 0) < 1:
+        return "⚠️ 优惠码无效或已用完。", None
+    if not await user_matches_audience(session, user_id, promo):
+        return f"⚠️ 此优惠仅限{_audience_label(promo)}，您不符合条件。", None
+
+    plan = await session.get(Plan, promo.plan_id)
+    if plan is None or not plan.is_active:
+        return "⚠️ 优惠码对应套餐不可用。", None
+
+    try:
+        order = await grant_subscription(
+            session,
+            user_id,
+            promo.plan_id,
+            promo.grant_days,
+            promo_id=promo.id,
+        )
+        await increment_promo_use(session, promo)
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        logger.error("Trial code redeem failed user=%d promo=%s: %s", user_id, promo.id, e)
+        return "⚠️ 兑换失败，请稍后重试或联系管理员。", None
+
+    plan_name = plan.name
+    days = promo.grant_days
+    msg = f"🎁 体验已开通：<b>{plan_name}</b> {days} 天。"
+    return msg, order.id
 
 
 async def user_had_group_subscription(
@@ -251,15 +293,22 @@ async def find_discount_row_by_code(
     session: AsyncSession, raw: str | None
 ) -> PromoCampaign | None:
     """Find a discount campaign by code (any status). None if no such code."""
+    promo = await find_promo_row_by_code(session, raw)
+    if promo is None or promo.kind != PromoKind.discount:
+        return None
+    return promo
+
+
+async def find_promo_row_by_code(
+    session: AsyncSession, raw: str | None
+) -> PromoCampaign | None:
+    """Find trial or discount campaign by code (any status)."""
     code = normalize_code(raw)
     if not code or not is_valid_code_format(code):
         return None
     return (
         await session.execute(
-            select(PromoCampaign).where(
-                PromoCampaign.kind == PromoKind.discount,
-                PromoCampaign.code == code,
-            )
+            select(PromoCampaign).where(PromoCampaign.code == code)
         )
     ).scalar_one_or_none()
 

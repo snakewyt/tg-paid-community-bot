@@ -29,7 +29,6 @@ from app.services.promo import (
     campaign_is_usable,
     clear_user_discount_promo,
     find_discount_by_payload,
-    find_discount_row_by_code,
     get_promo,
     get_user_discount_promo_id,
     looks_like_promo_code_message,
@@ -354,7 +353,7 @@ async def on_menu_profile(message: Message):
     ~F.text.startswith("/"),
 )
 async def on_promo_code_text(message: Message):
-    """Redeem discount by sending the promo code as plain text in private chat."""
+    """Redeem trial/discount by sending the promo code as plain text in private chat."""
     text = (message.text or "").strip()
     if text in _MENU_BUTTON_TEXTS:
         return
@@ -363,14 +362,34 @@ async def on_promo_code_text(message: Message):
 
     await _ensure_user(message.from_user)
     async with async_session_factory() as session:
-        promo = await find_discount_row_by_code(session, text)
+        from app.models.models import PromoKind
+        from app.services.promo import find_promo_row_by_code, redeem_trial_promo
+
+        promo = await find_promo_row_by_code(session, text)
         if promo is None:
             # Unknown token that only looks like a code — stay silent.
             return
-        feedback = await redeem_discount_promo(
-            session, message.from_user.id, promo, buy_hint=True
-        )
+        if promo.kind == PromoKind.trial:
+            feedback, order_id = await redeem_trial_promo(
+                session, message.from_user.id, promo
+            )
+        else:
+            feedback = await redeem_discount_promo(
+                session, message.from_user.id, promo, buy_hint=True
+            )
+            order_id = None
+
     await message.answer(feedback)
+    if order_id:
+        from app.services.notify import notify_fulfillment
+
+        result = await notify_fulfillment(order_id)
+        if result.link and not result.dm_sent:
+            await message.answer(f"入群邀请链接：{result.link}")
+        elif not result.link:
+            await message.answer(
+                "体验已开通，但入群链接创建失败，请联系管理员确认机器人是否为群管理员。"
+            )
 
 
 @user_router.callback_query(F.data.startswith("plan_select:"))
