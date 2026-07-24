@@ -35,6 +35,19 @@ class PaymentProvider(str, enum.Enum):
     wechat = "wechat"    # backend: epay or hupijiao
 
 
+class PromoKind(str, enum.Enum):
+    trial = "trial"
+    discount = "discount"
+
+
+class PromoAudience(str, enum.Enum):
+    """Who can use the promo."""
+
+    all = "all"  # anyone
+    new = "new"  # never had a subscription for this plan's group
+    returning = "returning"  # had a subscription for this plan's group before
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -81,6 +94,7 @@ class Order(Base):
     # True when a late paid callback fulfilled an already cancelled/expired order.
     revived: Mapped[bool] = mapped_column(default=False)
     payment_message_id: Mapped[Optional[int]] = mapped_column(default=None)
+    promo_id: Mapped[Optional[int]] = mapped_column(default=None)
     raw_callback: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -108,6 +122,35 @@ class BotChat(Base):
     is_admin: Mapped[bool] = mapped_column(default=False)
     # False once the bot is removed/kicked/left.
     is_member: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PromoCampaign(Base):
+    """Trial invite link or paid discount deep-link campaign."""
+
+    __tablename__ = "promo_campaigns"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255))
+    kind: Mapped[PromoKind] = mapped_column(Enum(PromoKind))
+    plan_id: Mapped[int] = mapped_column()
+    # all | new | returning — who may redeem this promo
+    audience: Mapped[PromoAudience] = mapped_column(
+        Enum(PromoAudience), default=PromoAudience.all
+    )
+    grant_days: Mapped[int] = mapped_column(default=0)
+    discount_percent: Mapped[int] = mapped_column(default=0)
+    discount_amount: Mapped[float] = mapped_column(default=0.0)
+    max_uses: Mapped[int] = mapped_column(default=0)
+    used_count: Mapped[int] = mapped_column(default=0)
+    invite_link: Mapped[Optional[str]] = mapped_column(String(512))
+    invite_link_name: Mapped[Optional[str]] = mapped_column(String(64))
+    start_payload: Mapped[Optional[str]] = mapped_column(String(64))
+    is_active: Mapped[bool] = mapped_column(default=True)
+    link_expire_at: Mapped[Optional[datetime]] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()

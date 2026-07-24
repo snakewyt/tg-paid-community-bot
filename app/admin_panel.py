@@ -35,6 +35,9 @@ from app.models.models import (
     Order,
     OrderStatus,
     Plan,
+    PromoAudience,
+    PromoCampaign,
+    PromoKind,
     Subscription,
     SubscriptionStatus,
     User,
@@ -205,9 +208,9 @@ def _csrf_check(request: Request, form_csrf: str) -> bool:
     return secrets.compare_digest(session_id, form_csrf)
 
 
-def _redirect(msg: str, err: bool = False) -> RedirectResponse:
+def _redirect(msg: str, err: bool = False, *, to: str = "/admin") -> RedirectResponse:
     flag = "err" if err else "ok"
-    return RedirectResponse(url=f"/admin?msg={quote(msg)}&t={flag}", status_code=303)
+    return RedirectResponse(url=f"{to}?msg={quote(msg)}&t={flag}", status_code=303)
 
 
 # ---------------------------------------------------------------------- styles
@@ -584,30 +587,6 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </form>
 {plans_table}
 
-<h2>赠送会员</h2>
-<form method="post" action="/admin/subs/grant" style="margin:0">
-<input type="hidden" name="csrf_token" value="{csrf_token}">
-<div class="formrow">
-  <span>用户:</span>
-  <input class="w130" name="user_id" type="text" placeholder="ID 或 @用户名" required>
-  <span>套餐:</span>
-  <select name="plan_id" style="width:180px">{grant_options}</select>
-  <span>天数:</span>
-  <input class="w60" name="days" type="number" min="1" placeholder="天数" required>
-  <button type="submit">赠送</button>
-</div>
-</form>
-
-<h2>会员管理</h2>
-<div class="formrow">
-  <form class="inline" method="get" action="/admin">
-    <span>搜索用户:</span>
-    <input class="w130" name="q" placeholder="ID 或 @用户名" value="{q}">
-    <button type="submit">搜索</button>
-  </form>
-</div>
-{subs_table}
-
 <h2>最近订单</h2>
 {orders_table}
 
@@ -624,6 +603,7 @@ def _esc(v) -> str:
 
 _NAV_ITEMS = [
     ("dashboard", "/admin", "📊", "首页"),
+    ("members", "/admin/members", "👥", "会员管理"),
     ("bot-config", "/admin/bot-config", "⚙️", "机器人配置"),
     ("settings", "/admin/settings", "💳", "支付设置"),
     ("change-password", "/admin/change-password", "🔒", "修改密码"),
@@ -842,7 +822,6 @@ async def admin_dashboard(request: Request):
             status_code=303,
         )
 
-    q = request.query_params.get("q", "").strip()
     msg = request.query_params.get("msg", "")
     msg_type = request.query_params.get("t", "ok")
 
@@ -915,30 +894,6 @@ async def admin_dashboard(request: Request):
                 select(Order).order_by(Order.created_at.desc()).limit(20)
             )
         ).scalars().all()
-
-        sub_stmt = select(Subscription).where(
-            Subscription.status == SubscriptionStatus.active,
-            Subscription.expires_at > utcnow(),
-        )
-        if q:
-            user_ids = await find_user_ids_for_search(session, q)
-            if user_ids:
-                sub_stmt = sub_stmt.where(Subscription.user_id.in_(user_ids))
-            else:
-                sub_stmt = sub_stmt.where(Subscription.user_id == -1)
-        subs = (
-            (await session.execute(sub_stmt.order_by(Subscription.expires_at).limit(50)))
-            .scalars()
-            .all()
-        )
-
-        sub_user_ids = {s.user_id for s in subs}
-        sub_users = (
-            await session.execute(select(User).where(User.id.in_(sub_user_ids)))
-        ).scalars().all() if sub_user_ids else []
-        user_labels = {
-            u.id: format_user_ref(u.id, u.username) for u in sub_users
-        }
 
     plan_names = {p.id: p.name for p in plans}
     csrf_token = request.cookies.get(SESSION_COOKIE, "")
@@ -1035,35 +990,6 @@ async def admin_dashboard(request: Request):
         for c in bot_chats
     )
 
-    # --- subscriptions table with manage actions ---
-    if subs:
-        now = utcnow()
-        rows = []
-        for s in subs:
-            rows.append(
-                f"<tr><td>{_esc(user_labels.get(s.user_id, str(s.user_id)))}</td>"
-                f"<td>{_esc(plan_names.get(s.plan_id, s.plan_id))}</td>"
-                f"<td>{s.expires_at.strftime('%Y-%m-%d %H:%M')}</td>"
-                f"<td>{max((s.expires_at - now).days, 0)} 天</td>"
-                f"<td><form class='inline' method='post' action='/admin/subs/adjust'>"
-                f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
-                f"<input type='hidden' name='sub_id' value='{s.id}'>"
-                f"<input class='w90' name='delta' placeholder='+7 / -3' required>"
-                f"<button type='submit'>调整</button></form> "
-                f"<form class='inline' method='post' action='/admin/subs/revoke' "
-                f"onsubmit=\"return confirm('确认移除该会员并踢出群?')\">"
-                f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
-                f"<input type='hidden' name='sub_id' value='{s.id}'>"
-                f"<button type='submit' class='danger'>移除</button></form></td></tr>"
-            )
-        subs_table = (
-            "<table><tr><th>用户 ID</th><th>套餐</th><th>到期 (UTC)</th>"
-            "<th>剩余</th><th>操作</th></tr>" + "".join(rows) + "</table>"
-        )
-    else:
-        hint = f"未找到用户 {_esc(q)} 的活跃订阅" if q else "暂无活跃订阅"
-        subs_table = f'<table><tr><td class="empty">{hint}</td></tr></table>'
-
     if recent_orders:
         rows = "".join(
             f"<tr><td>{_esc(o.id[:8])}</td><td>{o.user_id}</td>"
@@ -1083,17 +1009,11 @@ async def admin_dashboard(request: Request):
     else:
         orders_table = '<table><tr><td class="empty">暂无订单</td></tr></table>'
 
-    grant_options = "".join(
-        f'<option value="{p.id}">{_esc(p.name)} (ID:{p.id}, {p.duration_days}天)</option>'
-        for p in plans if p.is_active
-    ) or '<option value="">无可用套餐</option>'
-
     page = PAGE_TEMPLATE.format(
         generated_at=utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         sidebar=_nav_html("dashboard", username),
         flash=flash,
         csrf_token=_esc(csrf_token),
-        q=_esc(q),
         total_users=total_users,
         active_subs=active_subs_count,
         fulfilled_orders=fulfilled_count,
@@ -1103,8 +1023,6 @@ async def admin_dashboard(request: Request):
         bot_chats_table=bot_chats_table,
         chat_options=chat_options,
         plans_table=plans_table,
-        grant_options=grant_options,
-        subs_table=subs_table,
         orders_table=orders_table,
     )
 
@@ -1242,7 +1160,7 @@ async def sub_grant(
         try:
             resolved_id = await resolve_telegram_user_id(session, user_id)
         except ValueError as e:
-            return _redirect(str(e), err=True)
+            return _redirect(str(e), err=True, to="/admin/members")
         try:
             from app.services.grant import grant_subscription
 
@@ -1251,7 +1169,7 @@ async def sub_grant(
             user = await session.get(User, resolved_id)
             await session.commit()
         except ValueError as e:
-            return _redirect(str(e), err=True)
+            return _redirect(str(e), err=True, to="/admin/members")
 
     from app.services.notify import notify_fulfillment
 
@@ -1262,12 +1180,17 @@ async def sub_grant(
         return _redirect(
             "会员已赠送,但邀请链接创建失败——请确保机器人是该群管理员",
             err=True,
+            to="/admin/members",
         )
     if result.dm_sent:
-        return _redirect(f"已赠送 {days} 天「{plan_name}」给用户 {label}，邀请链接已发送至 Telegram")
+        return _redirect(
+            f"已赠送 {days} 天「{plan_name}」给用户 {label}，邀请链接已发送至 Telegram",
+            to="/admin/members",
+        )
     return _redirect(
         f"已赠送 {days} 天「{plan_name}」给用户 {label}。"
-        f"对方未与机器人对话，无法私聊发送。请手动转发入群链接：{result.link}"
+        f"对方未与机器人对话，无法私聊发送。请手动转发入群链接：{result.link}",
+        to="/admin/members",
     )
 
 
@@ -1288,11 +1211,11 @@ async def sub_adjust(
     async with async_session_factory() as session:
         sub = await session.get(Subscription, sub_id)
         if not sub:
-            return _redirect("订阅不存在", err=True)
+            return _redirect("订阅不存在", err=True, to="/admin/members")
         try:
             sub.expires_at = apply_expiry_delta(sub.expires_at, delta)
         except ValueError:
-            return _redirect("无效的调整值,用 +7 / -3 / YYYY-MM-DD", err=True)
+            return _redirect("无效的调整值,用 +7 / -3 / YYYY-MM-DD", err=True, to="/admin/members")
         sub.last_reminded_at = None
         new_expiry = sub.expires_at
         user_id = sub.user_id
@@ -1320,7 +1243,10 @@ async def sub_adjust(
     except Exception as e:
         logger.warning("Adjust expiry notify failed user=%d: %s", user_id, e)
 
-    return _redirect(f"用户 {user_id} 到期时间已调整为 {new_expiry.strftime('%Y-%m-%d %H:%M')}")
+    return _redirect(
+        f"用户 {user_id} 到期时间已调整为 {new_expiry.strftime('%Y-%m-%d %H:%M')}",
+        to="/admin/members",
+    )
 
 
 @admin_panel_router.post("/admin/subs/revoke")
@@ -1335,7 +1261,7 @@ async def sub_revoke(
     async with async_session_factory() as session:
         sub = await session.get(Subscription, sub_id)
         if not sub:
-            return _redirect("订阅不存在", err=True)
+            return _redirect("订阅不存在", err=True, to="/admin/members")
         sub.status = SubscriptionStatus.kicked
         user_id, chat_id = sub.user_id, sub.group_chat_id
         await session.commit()
@@ -1347,9 +1273,578 @@ async def sub_revoke(
         await bot.unban_chat_member(chat_id=chat_id, user_id=user_id)
     except Exception as e:
         logger.error("Panel revoke: failed to kick user %d: %s", user_id, e)
-        return _redirect(f"订阅已标记移除,但踢人失败(检查机器人权限): {e}", err=True)
+        return _redirect(
+            f"订阅已标记移除,但踢人失败(检查机器人权限): {e}",
+            err=True,
+            to="/admin/members",
+        )
 
-    return _redirect(f"用户 {user_id} 已移除并踢出群")
+    return _redirect(f"用户 {user_id} 已移除并踢出群", to="/admin/members")
+
+
+# ---------------------------------------------------------------- members page
+
+
+MEMBERS_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>会员管理 — 管理后台</title>
+""" + _HEAD_ASSETS + """
+</head>
+<body class="layout-body">
+<div class="layout">
+{sidebar}
+<main class="main-content">
+<div class="page-hdr">
+  <div>
+    <div class="page-title">会员管理</div>
+    <div class="page-sub">赠送、搜索、导出与优惠链接</div>
+  </div>
+</div>
+{flash}
+
+<h2>赠送会员</h2>
+<form method="post" action="/admin/subs/grant" style="margin:0">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<div class="formrow">
+  <span>用户:</span>
+  <input class="w130" name="user_id" type="text" placeholder="ID 或 @用户名" required>
+  <span>套餐:</span>
+  <select name="plan_id" style="width:180px">{grant_options}</select>
+  <span>天数:</span>
+  <input class="w60" name="days" type="number" min="1" placeholder="天数" required>
+  <button type="submit">赠送</button>
+</div>
+</form>
+
+<h2>活跃会员</h2>
+<div class="formrow">
+  <form class="inline" method="get" action="/admin/members">
+    <span>搜索用户:</span>
+    <input class="w130" name="q" placeholder="ID 或 @用户名" value="{q}">
+    <button type="submit">搜索</button>
+  </form>
+  <a class="btn-save" href="/admin/members/export" style="text-decoration:none;display:inline-block;padding:8px 14px">导出 CSV</a>
+</div>
+{subs_table}
+
+<h2>免费体验邀请链接</h2>
+<p style="color:var(--muted);font-size:13px;margin:0 0 10px">用户通过链接申请入群后，自动获得下方天数会员；修改天数只影响之后新入群用户。新用户=该群从未有过会员记录，老用户=曾有过。</p>
+<form method="post" action="/admin/promos/trial/create" style="margin:0 0 12px">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<div class="formrow" style="flex-wrap:wrap">
+  <input class="w130" name="name" placeholder="活动名称" required>
+  <select name="plan_id" style="width:180px">{grant_options}</select>
+  <select name="audience" style="width:120px" title="适用用户">
+    <option value="all">全部用户</option>
+    <option value="new">仅新用户</option>
+    <option value="returning">仅老用户</option>
+  </select>
+  <input class="w60" name="grant_days" type="number" min="1" placeholder="天数" required>
+  <input class="w60" name="max_uses" type="number" min="0" placeholder="上限" value="0" title="0=不限">
+  <input class="w160" name="link_expire_at" type="datetime-local" title="链接过期时间（可选）">
+  <button type="submit">创建体验链接</button>
+</div>
+</form>
+{trial_table}
+
+<h2>付费折扣链接</h2>
+<p style="color:var(--muted);font-size:13px;margin:0 0 10px">用户打开 <code>t.me/Bot?start=promo_xxx</code> 后购买对应套餐按折扣计费；改折扣只影响之后新订单。可限制仅新用户或仅老用户。</p>
+<form method="post" action="/admin/promos/discount/create" style="margin:0 0 12px">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<div class="formrow" style="flex-wrap:wrap">
+  <input class="w130" name="name" placeholder="活动名称" required>
+  <select name="plan_id" style="width:180px">{grant_options}</select>
+  <select name="audience" style="width:120px" title="适用用户">
+    <option value="all">全部用户</option>
+    <option value="new">仅新用户</option>
+    <option value="returning">仅老用户</option>
+  </select>
+  <input class="w60" name="discount_percent" type="number" min="0" max="99" placeholder="%OFF" value="0">
+  <input class="w80" name="discount_amount" type="number" step="0.01" min="0" placeholder="减免额" value="0" title="百分比优先；都填0无效">
+  <input class="w60" name="max_uses" type="number" min="0" placeholder="上限" value="0" title="0=不限">
+  <button type="submit">创建折扣链接</button>
+</div>
+</form>
+{discount_table}
+
+</main>
+</div>
+""" + _THEME_SCRIPT + """
+</body>
+</html>"""
+
+
+def _parse_optional_datetime(raw: str):
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            from datetime import datetime as _dt
+            return _dt.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+@admin_panel_router.get("/admin/members", response_class=HTMLResponse)
+async def members_page(request: Request):
+    username = _get_session(request)
+    if not username:
+        return RedirectResponse(url="/admin/login", status_code=303)
+    if not _password_changed():
+        return RedirectResponse(
+            url="/admin/change-password?msg=首次登录，请修改默认密码",
+            status_code=303,
+        )
+
+    q = request.query_params.get("q", "").strip()
+    msg = request.query_params.get("msg", "")
+    msg_type = request.query_params.get("t", "ok")
+    csrf_token = request.cookies.get(SESSION_COOKIE, "")
+
+    async with async_session_factory() as session:
+        plans = (await session.execute(select(Plan))).scalars().all()
+        plan_names = {p.id: p.name for p in plans}
+
+        sub_stmt = select(Subscription).where(
+            Subscription.status == SubscriptionStatus.active,
+            Subscription.expires_at > utcnow(),
+        )
+        if q:
+            user_ids = await find_user_ids_for_search(session, q)
+            if user_ids:
+                sub_stmt = sub_stmt.where(Subscription.user_id.in_(user_ids))
+            else:
+                sub_stmt = sub_stmt.where(Subscription.user_id == -1)
+        subs = (
+            (await session.execute(sub_stmt.order_by(Subscription.expires_at).limit(100)))
+            .scalars()
+            .all()
+        )
+        sub_user_ids = {s.user_id for s in subs}
+        sub_users = (
+            await session.execute(select(User).where(User.id.in_(sub_user_ids)))
+        ).scalars().all() if sub_user_ids else []
+        user_labels = {u.id: format_user_ref(u.id, u.username) for u in sub_users}
+
+        from app.services.promo import list_promos
+        trials = await list_promos(session, kind=PromoKind.trial)
+        discounts = await list_promos(session, kind=PromoKind.discount)
+
+    flash = ""
+    if msg:
+        cls = "flash err" if msg_type == "err" else "flash"
+        flash = f'<div class="{cls}">{_esc(msg)}</div>'
+
+    grant_options = "".join(
+        f'<option value="{p.id}">{_esc(p.name)} (ID:{p.id}, {p.duration_days}天)</option>'
+        for p in plans if p.is_active
+    ) or '<option value="">无可用套餐</option>'
+
+    if subs:
+        now = utcnow()
+        rows = []
+        for s in subs:
+            rows.append(
+                f"<tr><td>{_esc(user_labels.get(s.user_id, str(s.user_id)))}</td>"
+                f"<td>{_esc(plan_names.get(s.plan_id, s.plan_id))}</td>"
+                f"<td>{s.expires_at.strftime('%Y-%m-%d %H:%M')}</td>"
+                f"<td>{max((s.expires_at - now).days, 0)} 天</td>"
+                f"<td><form class='inline' method='post' action='/admin/subs/adjust'>"
+                f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+                f"<input type='hidden' name='sub_id' value='{s.id}'>"
+                f"<input class='w90' name='delta' placeholder='+7 / -3' required>"
+                f"<button type='submit'>调整</button></form> "
+                f"<form class='inline' method='post' action='/admin/subs/revoke' "
+                f"onsubmit=\"return confirm('确认移除该会员并踢出群?')\">"
+                f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+                f"<input type='hidden' name='sub_id' value='{s.id}'>"
+                f"<button type='submit' class='danger'>移除</button></form></td></tr>"
+            )
+        subs_table = (
+            "<table><tr><th>用户</th><th>套餐</th><th>到期 (UTC)</th>"
+            "<th>剩余</th><th>操作</th></tr>" + "".join(rows) + "</table>"
+        )
+    else:
+        hint = f"未找到用户 {_esc(q)} 的活跃订阅" if q else "暂无活跃订阅"
+        subs_table = f'<table><tr><td class="empty">{hint}</td></tr></table>'
+
+    trial_rows = []
+    from app.services.promo import AUDIENCE_LABELS, parse_audience
+    for p in trials:
+        uses = f"{p.used_count}/{p.max_uses}" if p.max_uses else f"{p.used_count}/∞"
+        status = "启用" if p.is_active else "停用"
+        link = _esc(p.invite_link or "")
+        aud = AUDIENCE_LABELS.get(
+            p.audience if isinstance(p.audience, PromoAudience) else parse_audience(str(getattr(p.audience, "value", p.audience))),
+            "全部用户",
+        )
+        trial_rows.append(
+            f"<tr><td>{p.id}</td><td>{_esc(p.name)}</td>"
+            f"<td>{_esc(plan_names.get(p.plan_id, p.plan_id))}</td>"
+            f"<td>{_esc(aud)}</td>"
+            f"<td><form class='inline' method='post' action='/admin/promos/trial/update'>"
+            f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+            f"<input type='hidden' name='promo_id' value='{p.id}'>"
+            f"<input class='w60' name='grant_days' type='number' min='1' value='{p.grant_days}'>"
+            f"<button type='submit'>改天数</button></form></td>"
+            f"<td>{uses}</td><td>{status}</td>"
+            f"<td style='max-width:220px;word-break:break-all'><code>{link}</code></td>"
+            f"<td><form class='inline' method='post' action='/admin/promos/toggle'>"
+            f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+            f"<input type='hidden' name='promo_id' value='{p.id}'>"
+            f"<button type='submit'>{'停用' if p.is_active else '启用'}</button></form> "
+            f"<form class='inline' method='post' action='/admin/promos/trial/revoke' "
+            f"onsubmit=\"return confirm('撤销该邀请链接?')\">"
+            f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+            f"<input type='hidden' name='promo_id' value='{p.id}'>"
+            f"<button type='submit' class='danger'>撤销链接</button></form></td></tr>"
+        )
+    trial_table = (
+        "<table><tr><th>ID</th><th>名称</th><th>套餐</th><th>适用</th><th>体验天数</th>"
+        "<th>已用</th><th>状态</th><th>链接</th><th>操作</th></tr>"
+        + ("".join(trial_rows) if trial_rows else '<tr><td class="empty" colspan="9">暂无体验链接</td></tr>')
+        + "</table>"
+    )
+
+    disc_rows = []
+    for p in discounts:
+        uses = f"{p.used_count}/{p.max_uses}" if p.max_uses else f"{p.used_count}/∞"
+        status = "启用" if p.is_active else "停用"
+        if p.discount_percent:
+            disc_label = f"{p.discount_percent}% OFF"
+        elif p.discount_amount:
+            disc_label = f"-{p.discount_amount:g}"
+        else:
+            disc_label = "—"
+        payload = _esc(p.start_payload or "")
+        aud = AUDIENCE_LABELS.get(
+            p.audience if isinstance(p.audience, PromoAudience) else parse_audience(str(getattr(p.audience, "value", p.audience))),
+            "全部用户",
+        )
+        disc_rows.append(
+            f"<tr><td>{p.id}</td><td>{_esc(p.name)}</td>"
+            f"<td>{_esc(plan_names.get(p.plan_id, p.plan_id))}</td>"
+            f"<td>{_esc(aud)}</td>"
+            f"<td><form class='inline' method='post' action='/admin/promos/discount/update'>"
+            f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+            f"<input type='hidden' name='promo_id' value='{p.id}'>"
+            f"<input class='w60' name='discount_percent' type='number' min='0' max='99' value='{p.discount_percent}'>"
+            f"<input class='w80' name='discount_amount' type='number' step='0.01' min='0' value='{p.discount_amount:g}'>"
+            f"<button type='submit'>改折扣</button></form><div style='font-size:12px;color:var(--muted)'>{_esc(disc_label)}</div></td>"
+            f"<td>{uses}</td><td>{status}</td>"
+            f"<td><code>?start={payload}</code></td>"
+            f"<td><form class='inline' method='post' action='/admin/promos/toggle'>"
+            f"<input type='hidden' name='csrf_token' value='{csrf_token}'>"
+            f"<input type='hidden' name='promo_id' value='{p.id}'>"
+            f"<button type='submit'>{'停用' if p.is_active else '启用'}</button></form></td></tr>"
+        )
+    discount_table = (
+        "<table><tr><th>ID</th><th>名称</th><th>套餐</th><th>适用</th><th>折扣</th>"
+        "<th>已用</th><th>状态</th><th>start 参数</th><th>操作</th></tr>"
+        + ("".join(disc_rows) if disc_rows else '<tr><td class="empty" colspan="9">暂无折扣链接</td></tr>')
+        + "</table>"
+    )
+
+    page = MEMBERS_PAGE.format(
+        sidebar=_nav_html("members", username),
+        flash=flash,
+        csrf_token=_esc(csrf_token),
+        q=_esc(q),
+        grant_options=grant_options,
+        subs_table=subs_table,
+        trial_table=trial_table,
+        discount_table=discount_table,
+    )
+    return HTMLResponse(content=page)
+
+
+@admin_panel_router.get("/admin/members/export")
+async def members_export(request: Request):
+    username = _get_session(request)
+    if not username or not _password_changed():
+        return Response(status_code=401)
+
+    import csv
+    import io
+
+    buf = io.StringIO()
+    # UTF-8 BOM for Excel
+    buf.write("\ufeff")
+    writer = csv.writer(buf)
+    writer.writerow([
+        "user_id", "username", "plan_name", "group_chat_id", "expires_at", "status",
+        "order_id", "provider", "amount", "currency", "order_created_at",
+    ])
+
+    async with async_session_factory() as session:
+        subs = (
+            await session.execute(
+                select(Subscription)
+                .where(
+                    Subscription.status == SubscriptionStatus.active,
+                    Subscription.expires_at > utcnow(),
+                )
+                .order_by(Subscription.expires_at)
+            )
+        ).scalars().all()
+        plan_ids = {s.plan_id for s in subs}
+        order_ids = {s.order_id for s in subs}
+        user_ids = {s.user_id for s in subs}
+        plans = (
+            await session.execute(select(Plan).where(Plan.id.in_(plan_ids)))
+        ).scalars().all() if plan_ids else []
+        orders = (
+            await session.execute(select(Order).where(Order.id.in_(order_ids)))
+        ).scalars().all() if order_ids else []
+        users = (
+            await session.execute(select(User).where(User.id.in_(user_ids)))
+        ).scalars().all() if user_ids else []
+        plan_map = {p.id: p for p in plans}
+        order_map = {o.id: o for o in orders}
+        user_map = {u.id: u for u in users}
+
+        for s in subs:
+            plan = plan_map.get(s.plan_id)
+            order = order_map.get(s.order_id)
+            user = user_map.get(s.user_id)
+            writer.writerow([
+                s.user_id,
+                user.username if user and user.username else "",
+                plan.name if plan else s.plan_id,
+                s.group_chat_id,
+                s.expires_at.strftime("%Y-%m-%d %H:%M:%S") if s.expires_at else "",
+                s.status.value if hasattr(s.status, "value") else s.status,
+                s.order_id,
+                (order.provider.value if order and hasattr(order.provider, "value") else (order.provider if order else "")),
+                order.amount if order else "",
+                order.currency if order else "",
+                order.created_at.strftime("%Y-%m-%d %H:%M:%S") if order and order.created_at else "",
+            ])
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="members_export.csv"',
+        },
+    )
+
+
+@admin_panel_router.post("/admin/promos/trial/create")
+async def promo_trial_create(
+    request: Request,
+    csrf_token: str = Form(""),
+    name: str = Form(...),
+    plan_id: int = Form(...),
+    audience: str = Form("all"),
+    grant_days: int = Form(...),
+    max_uses: int = Form(0),
+    link_expire_at: str = Form(""),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+    if grant_days < 1:
+        return _redirect("体验天数至少为 1", err=True, to="/admin/members")
+
+    expire = _parse_optional_datetime(link_expire_at)
+    from app.services.promo import parse_audience
+    audience_val = parse_audience(audience)
+
+    async with async_session_factory() as session:
+        plan = await session.get(Plan, plan_id)
+        if not plan or not plan.is_active:
+            return _redirect("套餐不存在或已停用", err=True, to="/admin/members")
+
+        promo = PromoCampaign(
+            name=name.strip() or "体验活动",
+            kind=PromoKind.trial,
+            plan_id=plan_id,
+            audience=audience_val,
+            grant_days=grant_days,
+            max_uses=max(0, max_uses),
+            link_expire_at=expire,
+            is_active=True,
+        )
+        session.add(promo)
+        await session.flush()
+        invite_name = f"promo_{promo.id}"
+        promo.invite_link_name = invite_name
+        await session.commit()
+        chat_id = plan.chat_id
+        promo_id = promo.id
+
+    try:
+        from app.services.invites import create_join_request_invite
+
+        link = await create_join_request_invite(
+            chat_id, name=invite_name, expire_date=expire
+        )
+    except Exception as e:
+        async with async_session_factory() as session:
+            promo = await session.get(PromoCampaign, promo_id)
+            if promo:
+                promo.is_active = False
+                await session.commit()
+        return _redirect(f"创建邀请链接失败: {e}", err=True, to="/admin/members")
+
+    async with async_session_factory() as session:
+        promo = await session.get(PromoCampaign, promo_id)
+        if promo:
+            promo.invite_link = link
+            await session.commit()
+
+    return _redirect(f"体验链接已创建：{link}", to="/admin/members")
+
+
+@admin_panel_router.post("/admin/promos/trial/update")
+async def promo_trial_update(
+    request: Request,
+    csrf_token: str = Form(""),
+    promo_id: int = Form(...),
+    grant_days: int = Form(...),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+    if grant_days < 1:
+        return _redirect("体验天数至少为 1", err=True, to="/admin/members")
+    async with async_session_factory() as session:
+        promo = await session.get(PromoCampaign, promo_id)
+        if not promo or promo.kind != PromoKind.trial:
+            return _redirect("活动不存在", err=True, to="/admin/members")
+        promo.grant_days = grant_days
+        await session.commit()
+    return _redirect(f"体验天数已更新为 {grant_days} 天", to="/admin/members")
+
+
+@admin_panel_router.post("/admin/promos/trial/revoke")
+async def promo_trial_revoke(
+    request: Request,
+    csrf_token: str = Form(""),
+    promo_id: int = Form(...),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+
+    async with async_session_factory() as session:
+        promo = await session.get(PromoCampaign, promo_id)
+        if not promo or promo.kind != PromoKind.trial:
+            return _redirect("活动不存在", err=True, to="/admin/members")
+        plan = await session.get(Plan, promo.plan_id)
+        link = promo.invite_link
+        chat_id = plan.chat_id if plan else None
+        promo.is_active = False
+        await session.commit()
+
+    if chat_id and link:
+        try:
+            from app.services.invites import revoke_invite_link
+            await revoke_invite_link(chat_id, link)
+        except Exception as e:
+            logger.warning("Revoke invite link failed promo=%s: %s", promo_id, e)
+            return _redirect(f"已停用活动，但撤销 Telegram 链接失败: {e}", err=True, to="/admin/members")
+
+    return _redirect("体验链接已撤销", to="/admin/members")
+
+
+@admin_panel_router.post("/admin/promos/discount/create")
+async def promo_discount_create(
+    request: Request,
+    csrf_token: str = Form(""),
+    name: str = Form(...),
+    plan_id: int = Form(...),
+    audience: str = Form("all"),
+    discount_percent: int = Form(0),
+    discount_amount: float = Form(0),
+    max_uses: int = Form(0),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+    if discount_percent <= 0 and discount_amount <= 0:
+        return _redirect("请填写折扣百分比或固定减免", err=True, to="/admin/members")
+    if discount_percent < 0 or discount_percent > 99:
+        return _redirect("折扣百分比须在 0–99", err=True, to="/admin/members")
+
+    from app.services.promo import make_start_payload, parse_audience
+    audience_val = parse_audience(audience)
+
+    async with async_session_factory() as session:
+        plan = await session.get(Plan, plan_id)
+        if not plan or not plan.is_active:
+            return _redirect("套餐不存在或已停用", err=True, to="/admin/members")
+        payload = make_start_payload()
+        promo = PromoCampaign(
+            name=name.strip() or "折扣活动",
+            kind=PromoKind.discount,
+            plan_id=plan_id,
+            audience=audience_val,
+            discount_percent=int(discount_percent or 0),
+            discount_amount=float(discount_amount or 0),
+            max_uses=max(0, max_uses),
+            start_payload=payload,
+            is_active=True,
+        )
+        session.add(promo)
+        await session.commit()
+        payload_saved = payload
+
+    bot_username = ""
+    try:
+        from app.bot.dispatcher import bot
+        me = await bot.get_me()
+        bot_username = me.username or ""
+    except Exception:
+        pass
+    link = (
+        f"https://t.me/{bot_username}?start={payload_saved}"
+        if bot_username
+        else f"?start={payload_saved}"
+    )
+    return _redirect(f"折扣链接已创建：{link}", to="/admin/members")
+
+
+@admin_panel_router.post("/admin/promos/discount/update")
+async def promo_discount_update(
+    request: Request,
+    csrf_token: str = Form(""),
+    promo_id: int = Form(...),
+    discount_percent: int = Form(0),
+    discount_amount: float = Form(0),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+    if discount_percent <= 0 and discount_amount <= 0:
+        return _redirect("请填写折扣百分比或固定减免", err=True, to="/admin/members")
+    async with async_session_factory() as session:
+        promo = await session.get(PromoCampaign, promo_id)
+        if not promo or promo.kind != PromoKind.discount:
+            return _redirect("活动不存在", err=True, to="/admin/members")
+        promo.discount_percent = int(discount_percent or 0)
+        promo.discount_amount = float(discount_amount or 0)
+        await session.commit()
+    return _redirect("折扣已更新", to="/admin/members")
+
+
+@admin_panel_router.post("/admin/promos/toggle")
+async def promo_toggle(
+    request: Request,
+    csrf_token: str = Form(""),
+    promo_id: int = Form(...),
+):
+    if not _get_session(request) or not _csrf_check(request, csrf_token) or not _password_changed():
+        return Response(status_code=401)
+    async with async_session_factory() as session:
+        promo = await session.get(PromoCampaign, promo_id)
+        if not promo:
+            return _redirect("活动不存在", err=True, to="/admin/members")
+        promo.is_active = not promo.is_active
+        state = "已启用" if promo.is_active else "已停用"
+        await session.commit()
+    return _redirect(f"活动 #{promo_id} {state}", to="/admin/members")
 
 
 # ---------------------------------------------------------------- settings page

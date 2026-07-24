@@ -10,6 +10,8 @@ from aiogram.exceptions import TelegramBadRequest
 from app.bot.dispatcher import bot
 from app.database import async_session_factory
 from app.models.models import Order, Plan
+from app.services.invites import create_join_request_invite
+from app.services.promo import get_promo, increment_promo_use
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,14 @@ async def notify_fulfillment(order_id: str) -> FulfillmentResult:
         user_id = order.user_id
         plan_name = plan.name
         payment_message_id = order.payment_message_id
+        promo_id = order.promo_id
+
+        # Count discount promo use once payment is fulfilled.
+        if promo_id and order.currency != "GRANT":
+            promo = await get_promo(session, promo_id)
+            if promo is not None:
+                await increment_promo_use(session, promo)
+                await session.commit()
 
     if payment_message_id:
         try:
@@ -50,12 +60,10 @@ async def notify_fulfillment(order_id: str) -> FulfillmentResult:
             logger.warning("Failed to delete payment message for order %s: %s", order_id, e)
 
     try:
-        invite = await bot.create_chat_invite_link(
-            chat_id=chat_id,
-            creates_join_request=True,
+        link = await create_join_request_invite(
+            chat_id,
             name=f"sub_{order_id[:12]}",
         )
-        link = invite.invite_link
     except TelegramBadRequest as e:
         logger.error("Failed to create invite link for chat %d: %s", chat_id, e)
         try:

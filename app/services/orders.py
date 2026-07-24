@@ -39,6 +39,8 @@ async def create_order(
     provider: BasePaymentProvider,
     amount: float,
     currency: str,
+    *,
+    promo_id: int | None = None,
 ) -> Order:
     order = Order(
         user_id=user_id,
@@ -47,6 +49,7 @@ async def create_order(
         amount=amount,
         currency=currency,
         status=OrderStatus.pending,
+        promo_id=promo_id,
     )
     session.add(order)
     await session.flush()

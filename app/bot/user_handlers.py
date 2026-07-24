@@ -5,7 +5,7 @@ from __future__ import annotations
 import urllib.parse
 
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -24,7 +24,16 @@ from app.models.models import Order, OrderStatus, Plan, User
 from app.payments.base import list_configured_providers, get_provider
 from app.services.membership import get_active_subscriptions
 from app.services.orders import cancel_user_pending_orders, create_order
-
+from app.services.promo import (
+    apply_discount,
+    campaign_is_usable,
+    clear_user_discount_promo,
+    find_discount_by_payload,
+    get_promo,
+    get_user_discount_promo_id,
+    set_user_discount_promo,
+    user_matches_audience,
+)
 user_router = Router()
 
 # Persistent bottom-menu button labels (matched by exact message text).
@@ -145,12 +154,88 @@ async def _send_plan_selection(message: Message, *, header: str | None = None) -
     )
 
 
+async def _resolve_user_promo(user_id: int, plan_id: int):
+    """Return usable discount promo for this user+plan, or None."""
+    promo_id = get_user_discount_promo_id(user_id)
+    if not promo_id:
+        return None
+    async with async_session_factory() as session:
+        promo = await get_promo(session, promo_id)
+        if promo is None or not campaign_is_usable(promo):
+            clear_user_discount_promo(user_id)
+            return None
+        if promo.plan_id != plan_id:
+            return None
+        if not await user_matches_audience(session, user_id, promo):
+            clear_user_discount_promo(user_id)
+            return None
+        return promo
+
+
+def _fmt_price_line(label: str, original, discounted, *, unit: str, is_int: bool = False) -> str:
+    if discounted is None or discounted == original:
+        if is_int:
+            return f"{label}: {int(original)} {unit}"
+        return f"{label}: {original:g} {unit}" if isinstance(original, float) else f"{label}: {original} {unit}"
+    if is_int:
+        return f"{label}: <s>{int(original)}</s> → <b>{int(discounted)}</b> {unit}"
+    if unit == "USD":
+        return f"{label}: <s>${original / 100:.2f}</s> → <b>${discounted / 100:.2f}</b>"
+    return f"{label}: <s>{original:g}</s> → <b>{discounted:g}</b> {unit}"
+
+
+def _discounted_amount(raw_amount: float, promo, *, as_int: bool = False) -> float:
+    discounted = apply_discount(float(raw_amount), promo)
+    if as_int:
+        # Stars / Stripe cents must stay integers; keep at least 1 if original > 0.
+        val = int(round(discounted))
+        if raw_amount > 0 and val < 1:
+            val = 1
+        return float(val)
+    return discounted
+
+
 @user_router.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, command: CommandObject):
     await _ensure_user(message.from_user)
 
+    promo_note = ""
+    payload = (command.args or "").strip() if command else ""
+    if payload:
+        async with async_session_factory() as session:
+            promo = await find_discount_by_payload(session, payload)
+            if promo is not None:
+                if not await user_matches_audience(session, message.from_user.id, promo):
+                    clear_user_discount_promo(message.from_user.id)
+                    promo_note = (
+                        "\n\n⚠️ 此优惠仅限"
+                        + (
+                            "新用户"
+                            if getattr(promo.audience, "value", promo.audience) == "new"
+                            else "老用户"
+                        )
+                        + "，您不符合条件。"
+                    )
+                else:
+                    set_user_discount_promo(message.from_user.id, promo.id)
+                    plan = await session.get(Plan, promo.plan_id)
+                    plan_name = plan.name if plan else f"套餐#{promo.plan_id}"
+                    if promo.discount_percent:
+                        promo_note = (
+                            f"\n\n🎁 已应用优惠：<b>{plan_name}</b> {promo.discount_percent}% OFF"
+                        )
+                    elif promo.discount_amount:
+                        promo_note = (
+                            f"\n\n🎁 已应用优惠：<b>{plan_name}</b> 减免 {promo.discount_amount:g}"
+                        )
+                    else:
+                        promo_note = f"\n\n🎁 已应用优惠：<b>{plan_name}</b>"
+            else:
+                clear_user_discount_promo(message.from_user.id)
+                promo_note = "\n\n⚠️ 优惠链接无效或已用完。"
+
     welcome = (settings.welcome_message or "").strip() or "欢迎使用VIP会员机器人！"
-    await message.answer(welcome, reply_markup=_main_menu_keyboard())
+    await message.answer(welcome + promo_note, reply_markup=_main_menu_keyboard())
     await _send_plan_selection(message)
 
 
@@ -287,23 +372,39 @@ async def on_plan_select(callback: CallbackQuery):
         await callback.answer("Plan not found.", show_alert=True)
         return
 
+    promo = await _resolve_user_promo(callback.from_user.id, plan.id)
+
     providers = list_configured_providers()
     price_display = []
     for p in providers:
         if p.name == "stars" and plan.price_stars:
-            price_display.append(f"Stars: {plan.price_stars} XTR")
+            disc = _discounted_amount(plan.price_stars, promo, as_int=True) if promo else None
+            price_display.append(
+                _fmt_price_line("Stars", plan.price_stars, disc, unit="XTR", is_int=True)
+            )
         elif p.name == "crypto" and plan.price_crypto:
-            price_display.append(f"Crypto: {plan.price_crypto} USDT")
+            disc = _discounted_amount(plan.price_crypto, promo) if promo else None
+            price_display.append(_fmt_price_line("Crypto", plan.price_crypto, disc, unit="USDT"))
         elif p.name == "stripe" and plan.price_stripe:
-            price_display.append(f"Stripe: ${plan.price_stripe / 100:.2f}")
+            disc = _discounted_amount(plan.price_stripe, promo, as_int=True) if promo else None
+            if disc is None or disc == plan.price_stripe:
+                price_display.append(f"Stripe: ${plan.price_stripe / 100:.2f}")
+            else:
+                price_display.append(
+                    f"Stripe: <s>${plan.price_stripe / 100:.2f}</s> → <b>${disc / 100:.2f}</b>"
+                )
         elif p.name == "alipay" and plan.price_alipay:
-            price_display.append(f"支付宝: ¥{plan.price_alipay:.2f}")
+            disc = _discounted_amount(plan.price_alipay, promo) if promo else None
+            price_display.append(_fmt_price_line("支付宝", plan.price_alipay, disc, unit="CNY"))
         elif p.name == "wechat" and plan.price_wechat:
-            price_display.append(f"微信支付: ¥{plan.price_wechat:.2f}")
+            disc = _discounted_amount(plan.price_wechat, promo) if promo else None
+            price_display.append(_fmt_price_line("微信支付", plan.price_wechat, disc, unit="CNY"))
 
     text = f"<b>{plan.name}</b>\n"
     if plan.description:
         text += f"{plan.description}\n\n"
+    if promo:
+        text += "🎁 已应用优惠价格\n"
     text += "Prices:\n" + "\n".join(f"  • {p}" for p in price_display)
     text += "\n\nSelect payment method:"
 
@@ -434,11 +535,34 @@ async def on_pay_select(callback: CallbackQuery):
             await callback.answer("This payment method has no price set.", show_alert=True)
             return
 
+        promo = None
+        promo_id = get_user_discount_promo_id(callback.from_user.id)
+        if promo_id:
+            promo = await get_promo(session, promo_id)
+            if (
+                promo is None
+                or not campaign_is_usable(promo)
+                or promo.plan_id != plan_id
+                or not await user_matches_audience(session, callback.from_user.id, promo)
+            ):
+                promo = None
+                clear_user_discount_promo(callback.from_user.id)
+
+        as_int = provider_name in ("stars", "stripe")
+        if promo:
+            amount = _discounted_amount(float(amount), promo, as_int=as_int)
+
         # Cancel any stale pending orders for the same plan before creating new
         await cancel_user_pending_orders(session, callback.from_user.id, plan_id)
 
         order = await create_order(
-            session, callback.from_user.id, plan, provider, float(amount), currency
+            session,
+            callback.from_user.id,
+            plan,
+            provider,
+            float(amount),
+            currency,
+            promo_id=promo.id if promo else None,
         )
         order_id = order.id
         await session.commit()

@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Order, OrderStatus, PaymentProvider, Plan
-from app.services.orders import _fulfill
+from app.services.orders import OrderError, _fulfill
 
 
 async def grant_subscription(
@@ -13,6 +13,8 @@ async def grant_subscription(
     user_id: int,
     plan_id: int,
     days: int,
+    *,
+    promo_id: int | None = None,
 ) -> Order:
     """Create a zero-amount grant order and fulfil via the standard path."""
     if days < 1:
@@ -31,6 +33,7 @@ async def grant_subscription(
         amount=0,
         currency="GRANT",
         status=OrderStatus.pending,
+        promo_id=promo_id,
     )
     session.add(order)
     await session.flush()
