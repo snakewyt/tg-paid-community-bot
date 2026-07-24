@@ -1401,7 +1401,7 @@ MEMBERS_PAGE = """<!DOCTYPE html>
 <input type="hidden" name="csrf_token" value="{csrf_token}">
 <div class="formrow" style="flex-wrap:wrap">
   <input class="w130" name="name" placeholder="活动名称" required>
-  <select name="plan_id" style="width:180px">{grant_options}</select>
+  <select name="plan_id" style="width:180px" title="选择群/频道">{trial_chat_options}</select>
   <select name="audience" style="width:120px" title="适用用户">
     <option value="all">全部用户</option>
     <option value="new">仅新用户</option>
@@ -1421,7 +1421,7 @@ MEMBERS_PAGE = """<!DOCTYPE html>
 <input type="hidden" name="csrf_token" value="{csrf_token}">
 <div class="formrow" style="flex-wrap:wrap">
   <input class="w130" name="name" placeholder="活动名称" required>
-  <select name="plan_id" style="width:180px">{grant_options}</select>
+  <select name="plan_id" style="width:180px">{discount_options}</select>
   <select name="audience" style="width:120px" title="适用用户">
     <option value="all">全部用户</option>
     <option value="new">仅新用户</option>
@@ -1518,14 +1518,23 @@ async def members_page(request: Request):
 
     active_plans = [p for p in plans if p.is_active]
 
-    def _plan_select_label(p: Plan) -> str:
-        # Members page plan pickers: show group/channel title only.
-        return chat_titles.get(p.chat_id) or f"群 {p.chat_id}"
-
-    grant_options = "".join(
-        f'<option value="{p.id}">{_esc(_plan_select_label(p))}</option>'
-        for p in active_plans
+    # 赠送 / 折扣：按套餐完整名称选择
+    plan_name_options = "".join(
+        f'<option value="{p.id}">{_esc(p.name)}</option>' for p in active_plans
     ) or '<option value="">无可用套餐</option>'
+    grant_options = plan_name_options
+    discount_options = plan_name_options
+
+    # 体验：按群/频道去重，只显示社群名称（value 仍为该群下任一启用套餐 ID）
+    trial_opts = []
+    seen_chats: set[int] = set()
+    for p in active_plans:
+        if p.chat_id in seen_chats:
+            continue
+        seen_chats.add(p.chat_id)
+        label = chat_titles.get(p.chat_id) or f"群 {p.chat_id}"
+        trial_opts.append(f'<option value="{p.id}">{_esc(label)}</option>')
+    trial_chat_options = "".join(trial_opts) or '<option value="">无可用群组</option>'
 
     if subs:
         now = utcnow()
@@ -1533,7 +1542,7 @@ async def members_page(request: Request):
         for s in subs:
             rows.append(
                 f"<tr><td>{_esc(user_labels.get(s.user_id, str(s.user_id)))}</td>"
-                f"<td>{_esc(plan_chat_labels.get(s.plan_id, plan_names.get(s.plan_id, s.plan_id)))}</td>"
+                f"<td>{_esc(plan_names.get(s.plan_id, s.plan_id))}</td>"
                 f"<td>{s.expires_at.strftime('%Y-%m-%d %H:%M')}</td>"
                 f"<td>{max((s.expires_at - now).days, 0)} 天</td>"
                 f"<td><form class='inline' method='post' action='/admin/subs/adjust'>"
@@ -1548,7 +1557,7 @@ async def members_page(request: Request):
                 f"<button type='submit' class='danger'>移除</button></form></td></tr>"
             )
         subs_table = (
-            "<table><tr><th>用户</th><th>群组</th><th>到期 (UTC)</th>"
+            "<table><tr><th>用户</th><th>套餐</th><th>到期 (UTC)</th>"
             "<th>剩余</th><th>操作</th></tr>" + "".join(rows) + "</table>"
         )
     else:
@@ -1611,7 +1620,7 @@ async def members_page(request: Request):
         )
         disc_rows.append(
             f"<tr><td>{p.id}</td><td>{_esc(p.name)}</td>"
-            f"<td>{_esc(plan_chat_labels.get(p.plan_id, plan_names.get(p.plan_id, p.plan_id)))}</td>"
+            f"<td>{_esc(plan_names.get(p.plan_id, p.plan_id))}</td>"
             f"<td>{_esc(aud)}</td>"
             f"<td><code>{_esc(p.code or '—')}</code></td>"
             f"<td><form class='inline' method='post' action='/admin/promos/discount/update'>"
@@ -1628,7 +1637,7 @@ async def members_page(request: Request):
             f"<button type='submit'>{'停用' if p.is_active else '启用'}</button></form></td></tr>"
         )
     discount_table = (
-        "<table><tr><th>ID</th><th>名称</th><th>群组</th><th>适用</th><th>优惠码</th><th>折扣</th>"
+        "<table><tr><th>ID</th><th>名称</th><th>套餐</th><th>适用</th><th>优惠码</th><th>折扣</th>"
         "<th>已用</th><th>状态</th><th>start 参数</th><th>操作</th></tr>"
         + ("".join(disc_rows) if disc_rows else '<tr><td class="empty" colspan="10">暂无折扣活动</td></tr>')
         + "</table>"
@@ -1640,6 +1649,8 @@ async def members_page(request: Request):
         csrf_token=_esc(csrf_token),
         q=_esc(q),
         grant_options=grant_options,
+        trial_chat_options=trial_chat_options,
+        discount_options=discount_options,
         subs_table=subs_table,
         trial_table=trial_table,
         discount_table=discount_table,
