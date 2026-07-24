@@ -554,10 +554,41 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <h2>收入按支付渠道</h2>
 {provider_table}
 
+<h2>最近订单</h2>
+{orders_table}
+
+</main>
+</div>
+""" + _THEME_SCRIPT + """
+</body>
+</html>"""
+
+
+PLANS_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>套餐管理 — 管理后台</title>
+""" + _HEAD_ASSETS + """
+</head>
+<body class="layout-body">
+<div class="layout">
+{sidebar}
+<main class="main-content">
+<div class="page-hdr">
+  <div>
+    <div class="page-title">套餐管理</div>
+    <div class="page-sub">群组 / 频道与套餐定价</div>
+  </div>
+</div>
+{flash}
+
 <h2>机器人已加入的群组 / 频道</h2>
+<p style="color:var(--muted);font-size:13px;margin:0 0 10px">把机器人加入群组并设为管理员后，这里会自动出现；创建套餐时可从下方下拉选择 chat_id。</p>
 {bot_chats_table}
 
-<h2>套餐管理</h2>
+<h2>套餐列表</h2>
 <form method="post" action="/admin/plans/create" style="margin:0">
 <input type="hidden" name="csrf_token" value="{csrf_token}">
 <div class="formrow" style="flex-direction:column;align-items:stretch;gap:10px">
@@ -587,9 +618,6 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </form>
 {plans_table}
 
-<h2>最近订单</h2>
-{orders_table}
-
 </main>
 </div>
 """ + _THEME_SCRIPT + """
@@ -603,6 +631,7 @@ def _esc(v) -> str:
 
 _NAV_ITEMS = [
     ("dashboard", "/admin", "📊", "首页"),
+    ("plans", "/admin/plans", "📦", "套餐管理"),
     ("members", "/admin/members", "👥", "会员管理"),
     ("bot-config", "/admin/bot-config", "⚙️", "机器人配置"),
     ("settings", "/admin/settings", "💳", "支付设置"),
@@ -881,14 +910,6 @@ async def admin_dashboard(request: Request):
 
         plans = (await session.execute(select(Plan))).scalars().all()
 
-        bot_chats = (
-            await session.execute(
-                select(BotChat)
-                .where(BotChat.is_member == True)  # noqa: E712
-                .order_by(BotChat.is_admin.desc(), BotChat.updated_at.desc())
-            )
-        ).scalars().all()
-
         recent_orders = (
             await session.execute(
                 select(Order).order_by(Order.created_at.desc()).limit(20)
@@ -919,7 +940,75 @@ async def admin_dashboard(request: Request):
     else:
         provider_table = '<table><tr><td class="empty">暂无收入</td></tr></table>'
 
-    # --- plans table with edit/toggle forms ---
+    if recent_orders:
+        rows = "".join(
+            f"<tr><td>{_esc(o.id[:8])}</td><td>{o.user_id}</td>"
+            f"<td>{_esc(plan_names.get(o.plan_id, o.plan_id))}</td>"
+            f"<td>{_esc(PROVIDER_LABELS.get(o.provider.value, o.provider.value))}</td>"
+            f"<td>{o.amount:g} {_esc(o.currency)}</td>"
+            f"<td><span class=\"tag {_esc(o.status.value)}\">{_esc(o.status.value)}</span>"
+            + ('<span class="tag pending" title="超时关闭后又收到支付,已自动补发">迟付复活</span>' if getattr(o, "revived", False) else "")
+            + f"</td>"
+            f"<td>{o.created_at.strftime('%m-%d %H:%M') if o.created_at else '-'}</td></tr>"
+            for o in recent_orders
+        )
+        orders_table = (
+            "<table><tr><th>订单</th><th>用户</th><th>套餐</th><th>渠道</th>"
+            "<th>金额</th><th>状态</th><th>时间</th></tr>" + rows + "</table>"
+        )
+    else:
+        orders_table = '<table><tr><td class="empty">暂无订单</td></tr></table>'
+
+    page = PAGE_TEMPLATE.format(
+        generated_at=utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        sidebar=_nav_html("dashboard", username),
+        flash=flash,
+        csrf_token=_esc(csrf_token),
+        total_users=total_users,
+        active_subs=active_subs_count,
+        fulfilled_orders=fulfilled_count,
+        orders_7d=orders_7d,
+        revenue_cards=revenue_cards,
+        provider_table=provider_table,
+        orders_table=orders_table,
+    )
+
+    return HTMLResponse(content=page)
+
+
+# ---------------------------------------------------------------- plans page
+
+
+@admin_panel_router.get("/admin/plans", response_class=HTMLResponse)
+async def plans_page(request: Request):
+    username = _get_session(request)
+    if not username:
+        return RedirectResponse(url="/admin/login", status_code=303)
+    if not _password_changed():
+        return RedirectResponse(
+            url="/admin/change-password?msg=首次登录，请修改默认密码",
+            status_code=303,
+        )
+
+    msg = request.query_params.get("msg", "")
+    msg_type = request.query_params.get("t", "ok")
+    csrf_token = request.cookies.get(SESSION_COOKIE, "")
+
+    async with async_session_factory() as session:
+        plans = (await session.execute(select(Plan))).scalars().all()
+        bot_chats = (
+            await session.execute(
+                select(BotChat)
+                .where(BotChat.is_member == True)  # noqa: E712
+                .order_by(BotChat.is_admin.desc(), BotChat.updated_at.desc())
+            )
+        ).scalars().all()
+
+    flash = ""
+    if msg:
+        cls = "flash err" if msg_type == "err" else "flash"
+        flash = f'<div class="{cls}">{_esc(msg)}</div>'
+
     if plans:
         rows = []
         for p in plans:
@@ -953,7 +1042,6 @@ async def admin_dashboard(request: Request):
     else:
         plans_table = '<table><tr><td class="empty">暂无套餐,用上方表单创建</td></tr></table>'
 
-    # --- bot chats table + datalist options for the plan chat_id field ---
     _CHAT_TYPE_LABELS = {"group": "群组", "supergroup": "超级群", "channel": "频道"}
     if bot_chats:
         rows = []
@@ -990,42 +1078,14 @@ async def admin_dashboard(request: Request):
         for c in bot_chats
     )
 
-    if recent_orders:
-        rows = "".join(
-            f"<tr><td>{_esc(o.id[:8])}</td><td>{o.user_id}</td>"
-            f"<td>{_esc(plan_names.get(o.plan_id, o.plan_id))}</td>"
-            f"<td>{_esc(PROVIDER_LABELS.get(o.provider.value, o.provider.value))}</td>"
-            f"<td>{o.amount:g} {_esc(o.currency)}</td>"
-            f"<td><span class=\"tag {_esc(o.status.value)}\">{_esc(o.status.value)}</span>"
-            + ('<span class="tag pending" title="超时关闭后又收到支付,已自动补发">迟付复活</span>' if getattr(o, "revived", False) else "")
-            + f"</td>"
-            f"<td>{o.created_at.strftime('%m-%d %H:%M') if o.created_at else '-'}</td></tr>"
-            for o in recent_orders
-        )
-        orders_table = (
-            "<table><tr><th>订单</th><th>用户</th><th>套餐</th><th>渠道</th>"
-            "<th>金额</th><th>状态</th><th>时间</th></tr>" + rows + "</table>"
-        )
-    else:
-        orders_table = '<table><tr><td class="empty">暂无订单</td></tr></table>'
-
-    page = PAGE_TEMPLATE.format(
-        generated_at=utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        sidebar=_nav_html("dashboard", username),
+    page = PLANS_PAGE.format(
+        sidebar=_nav_html("plans", username),
         flash=flash,
         csrf_token=_esc(csrf_token),
-        total_users=total_users,
-        active_subs=active_subs_count,
-        fulfilled_orders=fulfilled_count,
-        orders_7d=orders_7d,
-        revenue_cards=revenue_cards,
-        provider_table=provider_table,
         bot_chats_table=bot_chats_table,
         chat_options=chat_options,
         plans_table=plans_table,
-        orders_table=orders_table,
     )
-
     return HTMLResponse(content=page)
 
 
@@ -1050,7 +1110,7 @@ async def plan_create(
 
     name = name.strip()[:255]
     if duration_days < 1:
-        return _redirect("天数至少为 1", err=True)
+        return _redirect("天数至少为 1", err=True, to="/admin/plans")
 
     # Validate the bot can actually access this chat
     try:
@@ -1058,7 +1118,11 @@ async def plan_create(
 
         await bot.get_chat(chat_id)
     except Exception:
-        return _redirect(f"机器人未加入群组 {chat_id}，请先将机器人添加为该群管理员", err=True)
+        return _redirect(
+            f"机器人未加入群组 {chat_id}，请先将机器人添加为该群管理员",
+            err=True,
+            to="/admin/plans",
+        )
 
     async with async_session_factory() as session:
         plan = Plan(
@@ -1074,7 +1138,7 @@ async def plan_create(
         session.add(plan)
         await session.commit()
 
-    return _redirect(f"套餐「{name}」已创建")
+    return _redirect(f"套餐「{name}」已创建", to="/admin/plans")
 
 
 @admin_panel_router.post("/admin/plans/update")
@@ -1096,12 +1160,12 @@ async def plan_update(
 
     name = name.strip()[:255]
     if duration_days < 1:
-        return _redirect("天数至少为 1", err=True)
+        return _redirect("天数至少为 1", err=True, to="/admin/plans")
 
     async with async_session_factory() as session:
         plan = await session.get(Plan, plan_id)
         if not plan:
-            return _redirect("套餐不存在", err=True)
+            return _redirect("套餐不存在", err=True, to="/admin/plans")
 
         # Reject chat_id changes — existing subscriptions are tied to the
         # original chat_id and cannot be migrated automatically.  Create a
@@ -1111,6 +1175,7 @@ async def plan_update(
                 f"不允许修改群组 ID（已有订阅绑定到群组 {plan.chat_id}）。"
                 f"如需更换群组，请新建套餐。",
                 err=True,
+                to="/admin/plans",
             )
 
         plan.name = name
@@ -1122,7 +1187,7 @@ async def plan_update(
         plan.price_wechat = price_wechat
         await session.commit()
 
-    return _redirect(f"套餐 #{plan_id} 已保存")
+    return _redirect(f"套餐 #{plan_id} 已保存", to="/admin/plans")
 
 
 @admin_panel_router.post("/admin/plans/toggle")
@@ -1137,12 +1202,12 @@ async def plan_toggle(
     async with async_session_factory() as session:
         plan = await session.get(Plan, plan_id)
         if not plan:
-            return _redirect("套餐不存在", err=True)
+            return _redirect("套餐不存在", err=True, to="/admin/plans")
         plan.is_active = not plan.is_active
         state = "恢复在售" if plan.is_active else "已停售"
         await session.commit()
 
-    return _redirect(f"套餐 #{plan_id} {state}")
+    return _redirect(f"套餐 #{plan_id} {state}", to="/admin/plans")
 
 
 @admin_panel_router.post("/admin/subs/grant")
