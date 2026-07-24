@@ -1507,6 +1507,9 @@ async def members_page(request: Request):
         chat_titles = {
             c.chat_id: (c.title or "").strip() or str(c.chat_id) for c in bot_chats
         }
+        plan_chat_labels = {
+            p.id: chat_titles.get(p.chat_id) or f"群 {p.chat_id}" for p in plans
+        }
 
     flash = ""
     if msg:
@@ -1514,16 +1517,10 @@ async def members_page(request: Request):
         flash = f'<div class="{cls}">{_esc(msg)}</div>'
 
     active_plans = [p for p in plans if p.is_active]
-    chat_plan_counts: dict[int, int] = {}
-    for p in active_plans:
-        chat_plan_counts[p.chat_id] = chat_plan_counts.get(p.chat_id, 0) + 1
 
     def _plan_select_label(p: Plan) -> str:
-        title = chat_titles.get(p.chat_id) or f"群 {p.chat_id}"
-        # Same group with multiple plans: keep group name primary, append plan name.
-        if chat_plan_counts.get(p.chat_id, 0) > 1:
-            return f"{title} · {p.name}"
-        return title
+        # Members page plan pickers: show group/channel title only.
+        return chat_titles.get(p.chat_id) or f"群 {p.chat_id}"
 
     grant_options = "".join(
         f'<option value="{p.id}">{_esc(_plan_select_label(p))}</option>'
@@ -1536,7 +1533,7 @@ async def members_page(request: Request):
         for s in subs:
             rows.append(
                 f"<tr><td>{_esc(user_labels.get(s.user_id, str(s.user_id)))}</td>"
-                f"<td>{_esc(plan_names.get(s.plan_id, s.plan_id))}</td>"
+                f"<td>{_esc(plan_chat_labels.get(s.plan_id, plan_names.get(s.plan_id, s.plan_id)))}</td>"
                 f"<td>{s.expires_at.strftime('%Y-%m-%d %H:%M')}</td>"
                 f"<td>{max((s.expires_at - now).days, 0)} 天</td>"
                 f"<td><form class='inline' method='post' action='/admin/subs/adjust'>"
@@ -1551,7 +1548,7 @@ async def members_page(request: Request):
                 f"<button type='submit' class='danger'>移除</button></form></td></tr>"
             )
         subs_table = (
-            "<table><tr><th>用户</th><th>套餐</th><th>到期 (UTC)</th>"
+            "<table><tr><th>用户</th><th>群组</th><th>到期 (UTC)</th>"
             "<th>剩余</th><th>操作</th></tr>" + "".join(rows) + "</table>"
         )
     else:
@@ -1570,7 +1567,7 @@ async def members_page(request: Request):
         )
         trial_rows.append(
             f"<tr><td>{p.id}</td><td>{_esc(p.name)}</td>"
-            f"<td>{_esc(plan_names.get(p.plan_id, p.plan_id))}</td>"
+            f"<td>{_esc(plan_chat_labels.get(p.plan_id, plan_names.get(p.plan_id, p.plan_id)))}</td>"
             f"<td>{_esc(aud)}</td>"
             f"<td><code>{_esc(p.code or '—')}</code></td>"
             f"<td><form class='inline' method='post' action='/admin/promos/trial/update'>"
@@ -1591,7 +1588,7 @@ async def members_page(request: Request):
             f"<button type='submit' class='danger'>撤销链接</button></form></td></tr>"
         )
     trial_table = (
-        "<table><tr><th>ID</th><th>名称</th><th>套餐</th><th>适用</th><th>优惠码</th><th>体验天数</th>"
+        "<table><tr><th>ID</th><th>名称</th><th>群组</th><th>适用</th><th>优惠码</th><th>体验天数</th>"
         "<th>已用</th><th>状态</th><th>链接</th><th>操作</th></tr>"
         + ("".join(trial_rows) if trial_rows else '<tr><td class="empty" colspan="10">暂无体验活动</td></tr>')
         + "</table>"
@@ -1614,7 +1611,7 @@ async def members_page(request: Request):
         )
         disc_rows.append(
             f"<tr><td>{p.id}</td><td>{_esc(p.name)}</td>"
-            f"<td>{_esc(plan_names.get(p.plan_id, p.plan_id))}</td>"
+            f"<td>{_esc(plan_chat_labels.get(p.plan_id, plan_names.get(p.plan_id, p.plan_id)))}</td>"
             f"<td>{_esc(aud)}</td>"
             f"<td><code>{_esc(p.code or '—')}</code></td>"
             f"<td><form class='inline' method='post' action='/admin/promos/discount/update'>"
@@ -1631,7 +1628,7 @@ async def members_page(request: Request):
             f"<button type='submit'>{'停用' if p.is_active else '启用'}</button></form></td></tr>"
         )
     discount_table = (
-        "<table><tr><th>ID</th><th>名称</th><th>套餐</th><th>适用</th><th>优惠码</th><th>折扣</th>"
+        "<table><tr><th>ID</th><th>名称</th><th>群组</th><th>适用</th><th>优惠码</th><th>折扣</th>"
         "<th>已用</th><th>状态</th><th>start 参数</th><th>操作</th></tr>"
         + ("".join(disc_rows) if disc_rows else '<tr><td class="empty" colspan="10">暂无折扣活动</td></tr>')
         + "</table>"
